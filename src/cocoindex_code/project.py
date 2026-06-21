@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
+import logging
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
 import cocoindex as coco
-from cocoindex.connectors import sqlite as coco_sqlite
+from cocoindex.connectors import lancedb as coco_lancedb
 
 from .chunking import CHUNKER_REGISTRY, ChunkerFn
 from .indexer import indexer_main
+from .lancedb_store import TABLE_NAME, ensure_vector_index
 from .protocol import (
     IndexingProgress,
     IndexProgressUpdate,
@@ -22,24 +23,26 @@ from .protocol import (
     ProjectStatusResponse,
     SearchResult,
 )
-from .query import query_codebase
+from .query import open_table, query_codebase
 from .settings import (
     cocoindex_db_path as _cocoindex_db_path,
 )
 from .settings import (
-    resolve_db_dir,
+    lancedb_dir_path as _lancedb_dir_path,
 )
 from .settings import (
-    target_sqlite_db_path as _target_sqlite_db_path,
+    resolve_db_dir,
 )
 from .shared import (
     CODEBASE_DIR,
     EMBEDDER,
     INDEXING_EMBED_PARAMS,
+    LANCE_DB,
     QUERY_EMBED_PARAMS,
-    SQLITE_DB,
     Embedder,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Project:
@@ -48,12 +51,17 @@ class Project:
     _project_root: Path
     _index_lock: asyncio.Lock
     _initial_index_done: asyncio.Event
+    # Set synchronously the moment an index task is created (before it acquires
+    # _index_lock) and cleared when it finishes. Lets a concurrent search detect
+    # an already-scheduled index and wait for it, instead of racing to spawn a
+    # second, redundant index pass against the same LanceDB table.
+    _indexing_scheduled: bool = False
     _indexing_stats: IndexingProgress | None = None
 
     def close(self) -> None:
-        """Close project resources to release file handles (LMDB, SQLite)."""
+        """Close project resources to release file handles (LMDB, LanceDB)."""
         try:
-            db = self._env.get_context(SQLITE_DB)
+            db = self._env.get_context(LANCE_DB)
             db.close()
         except Exception:
             pass
@@ -108,21 +116,87 @@ class Project:
                     if on_progress is not None:
                         on_progress(progress)
                     await asyncio.sleep(0.1)
+            await self._ensure_vector_index()
         finally:
             self._initial_index_done.set()
             self._indexing_stats = None
+
+    async def _ensure_vector_index(self) -> None:
+        """Build the HNSW vector index after indexing, once the table is large
+        enough to benefit. Failures are logged, not raised: an index is a query
+        optimization, and search still works via LanceDB's flat fallback.
+        """
+        try:
+            conn = self._env.get_context(LANCE_DB)
+            table = await conn.open_table(TABLE_NAME)
+            if await ensure_vector_index(table):
+                logger.info("Built HNSW vector index for %s", self._project_root)
+        except (FileNotFoundError, ValueError):
+            # No table yet (nothing indexed) — nothing to index.
+            pass
+        except Exception:
+            logger.exception("Failed to build HNSW vector index")
+
+    def _spawn_index(
+        self,
+        on_progress: Callable[[IndexingProgress], None] | None = None,
+        on_started: asyncio.Event | None = None,
+    ) -> asyncio.Task[None]:
+        """Create a background index task, marking indexing as scheduled.
+
+        ``_indexing_scheduled`` is flipped synchronously here (before the task
+        runs) so concurrent callers observe a pending index immediately and do
+        not start a competing pass. The done-callback clears it.
+        """
+        self._indexing_scheduled = True
+        task = asyncio.create_task(self.run_index(on_progress=on_progress, on_started=on_started))
+
+        def _clear(_task: asyncio.Task[None]) -> None:
+            self._indexing_scheduled = False
+
+        task.add_done_callback(_clear)
+        return task
+
+    @property
+    def is_indexing(self) -> bool:
+        """True if an index pass is running or scheduled to run imminently.
+
+        Covers both the window after a task is created but before it acquires
+        the lock (``_indexing_scheduled``) and the window while it holds the
+        lock. Used to decide whether a search should refresh the index or read
+        the current table concurrently.
+        """
+        return self._index_lock.locked() or self._indexing_scheduled
+
+    async def refresh_index(self) -> None:
+        """Run an incremental index pass and wait for it to finish.
+
+        Spawned as an independent task (rather than awaited inline) so a client
+        disconnect cancelling the request handler does not abort the indexing
+        mid-write; the handle is then awaited for completion.
+
+        Callers must check :attr:`is_indexing` first and skip this when an index
+        is already in flight — otherwise this queues a redundant second pass
+        behind the lock instead of reading concurrently.
+        """
+        await self._spawn_index()
 
     async def ensure_indexing_started(self) -> None:
         """Kick off background indexing and wait until it has actually started.
 
         Returns once the indexing task holds the lock.  Safe to call multiple
-        times — only the first call spawns a task; subsequent calls return
-        immediately.
+        times — only the first call spawns a task; subsequent calls (including a
+        search arriving while an explicit index is already scheduled) return
+        immediately without starting a redundant pass.
         """
-        if self._initial_index_done.is_set() or self._index_lock.locked():
+        if (
+            self._initial_index_done.is_set()
+            or self._index_lock.locked()
+            or self._indexing_scheduled
+        ):
             return
         started = asyncio.Event()
-        asyncio.create_task(self.run_index(on_started=started))
+        self._spawn_index(on_started=started)
         await started.wait()
 
     async def stream_index(self) -> AsyncIterator[IndexStreamResponse]:
@@ -136,9 +210,7 @@ class Project:
             yield IndexWaitingNotice()
 
         progress_queue: asyncio.Queue[IndexingProgress] = asyncio.Queue()
-        index_task = asyncio.create_task(
-            self.run_index(on_progress=lambda p: progress_queue.put_nowait(p))
-        )
+        index_task = self._spawn_index(on_progress=lambda p: progress_queue.put_nowait(p))
 
         try:
             while not index_task.done():
@@ -183,10 +255,10 @@ class Project:
         offset: int = 0,
     ) -> list[SearchResult]:
         """Search within this project."""
-        target_db = _target_sqlite_db_path(self._project_root)
+        table = await open_table(self._env)
         results = await query_codebase(
             query=query,
-            target_sqlite_db_path=target_db,
+            table=table,
             env=self._env,
             limit=limit,
             offset=offset,
@@ -209,25 +281,24 @@ class Project:
     # Status
     # ------------------------------------------------------------------
 
-    def get_status(self) -> ProjectStatusResponse:
-        """Get index stats by querying the SQLite database."""
-        db = self._env.get_context(SQLITE_DB)
+    async def get_status(self) -> ProjectStatusResponse:
+        """Get index stats by querying the LanceDB table."""
         index_exists = True
+        total_chunks = 0
+        total_files = 0
+        languages: dict[str, int] = {}
         try:
-            with db.readonly() as conn:
-                total_chunks = conn.execute("SELECT COUNT(*) FROM code_chunks_vec").fetchone()[0]
-                total_files = conn.execute(
-                    "SELECT COUNT(DISTINCT file_path) FROM code_chunks_vec"
-                ).fetchone()[0]
-                lang_rows = conn.execute(
-                    "SELECT language, COUNT(*) as cnt FROM code_chunks_vec"
-                    " GROUP BY language ORDER BY cnt DESC"
-                ).fetchall()
-        except sqlite3.OperationalError:
+            conn = self._env.get_context(LANCE_DB)
+            table = await conn.open_table(TABLE_NAME)
+            total_chunks = await table.count_rows()
+            rows = await table.query().select(["file_path", "language"]).to_list()
+            files: set[str] = set()
+            for row in rows:
+                files.add(row["file_path"])
+                languages[row["language"]] = languages.get(row["language"], 0) + 1
+            total_files = len(files)
+        except (FileNotFoundError, ValueError):
             index_exists = False
-            total_chunks = 0
-            total_files = 0
-            lang_rows = []
 
         is_indexing = self._index_lock.locked()
         progress = self._indexing_stats if is_indexing else None
@@ -235,7 +306,7 @@ class Project:
             indexing=is_indexing,
             total_chunks=total_chunks,
             total_files=total_files,
-            languages={lang: cnt for lang, cnt in lang_rows},
+            languages=languages,
             progress=progress,
             index_exists=index_exists,
         )
@@ -289,13 +360,16 @@ class Project:
         db_dir.mkdir(parents=True, exist_ok=True)
 
         cocoindex_db = _cocoindex_db_path(project_root)
-        target_sqlite_db = _target_sqlite_db_path(project_root)
+        lancedb_dir = _lancedb_dir_path(project_root)
+        lancedb_dir.mkdir(parents=True, exist_ok=True)
 
         settings = coco.Settings.from_env(cocoindex_db)
 
+        lance_conn = await coco_lancedb.connect_async(str(lancedb_dir))
+
         context = coco.ContextProvider()
         context.provide(CODEBASE_DIR, project_root)
-        context.provide(SQLITE_DB, coco_sqlite.connect(str(target_sqlite_db), load_vec=True))
+        context.provide(LANCE_DB, lance_conn)
         context.provide(EMBEDDER, embedder)
         context.provide(INDEXING_EMBED_PARAMS, dict(indexing_params))
         context.provide(QUERY_EMBED_PARAMS, dict(query_params))
@@ -316,4 +390,5 @@ class Project:
         result._project_root = project_root
         result._index_lock = asyncio.Lock()
         result._initial_index_done = asyncio.Event()
+        result._indexing_scheduled = False
         return result

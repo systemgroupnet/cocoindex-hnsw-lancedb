@@ -27,12 +27,12 @@ from .settings import (
     find_parent_with_marker,
     find_project_root,
     format_path_for_display,
+    lancedb_dir_path,
     normalize_input_path,
     project_settings_path,
     resolve_db_dir,
     save_initial_user_settings,
     save_project_settings,
-    target_sqlite_db_path,
     user_settings_path,
 )
 
@@ -258,6 +258,10 @@ def _search_with_wait_spinner(
             paths=paths,
             limit=limit,
             offset=offset,
+            # The `ccc search --refresh` flag runs its own foreground index
+            # (with progress) before reaching here, so never refresh again
+            # daemon-side.
+            refresh=False,
             on_waiting=_on_waiting,
         )
 
@@ -668,11 +672,67 @@ def status() -> None:
     print_project_header(project_root)
 
     _typer.echo(f"Settings: {format_path_for_display(project_settings_path(project_root_path))}")
-    db_path = target_sqlite_db_path(project_root_path)
+    db_path = lancedb_dir_path(project_root_path)
     if db_path.exists():
         _typer.echo(f"Index DB: {format_path_for_display(db_path)}")
 
     print_index_stats(_client.project_status(project_root))
+
+
+def _try_delete_paths(paths: list[Path]) -> list[Path]:
+    """Best-effort delete files/dirs. Returns the paths that are still locked."""
+    import shutil as _shutil
+
+    locked: list[Path] = []
+    for path in paths:
+        try:
+            if path.is_dir():
+                _shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+        except PermissionError:
+            # Windows: a file handle (LanceDB mmap / LMDB) is still held.
+            locked.append(path)
+    return locked
+
+
+def _delete_index_paths(paths: list[Path]) -> None:
+    """Delete index files, releasing daemon-held handles if needed.
+
+    The daemon keeps the LanceDB store and LMDB state memory-mapped. Even after
+    ``remove_project`` drops the in-memory project, those OS handles are not
+    reliably released on Windows (the Rust environment is freed via GC, which
+    can lag). If a first pass leaves files locked, stop the daemon — process
+    exit releases every handle deterministically — and delete again. The daemon
+    auto-starts on the next command.
+    """
+    locked = _try_delete_paths(paths)
+    if not locked:
+        return
+
+    import time as _time
+
+    from .client import _wait_for_daemon_exit, stop_daemon
+
+    try:
+        stop_daemon()
+        # Wait for the process to actually exit; only then are its OS handles
+        # released. The PID file disappearing marks shutdown completion.
+        _wait_for_daemon_exit(timeout=10.0)
+    except Exception:
+        pass  # No daemon / already stopping — fall through to a final attempt.
+
+    # Even after the process exits, Windows can briefly hold the handle; retry.
+    still_locked = locked
+    for _ in range(20):
+        still_locked = _try_delete_paths(still_locked)
+        if not still_locked:
+            return
+        _time.sleep(0.1)
+
+    names = ", ".join(format_path_for_display(p) for p in still_locked)
+    _typer.echo(f"Error: could not delete (still in use): {names}", err=True)
+    raise _typer.Exit(code=1)
 
 
 @app.command()
@@ -687,7 +747,7 @@ def reset(
 
     db_files = [
         cocoindex_db_path(project_root),
-        target_sqlite_db_path(project_root),
+        lancedb_dir_path(project_root),
     ]
     settings_file = project_settings_path(project_root)
 
@@ -721,14 +781,11 @@ def reset(
     except (ConnectionRefusedError, OSError, RuntimeError):
         pass  # Daemon not running — that's fine
 
-    # Delete files/directories
-    import shutil as _shutil
-
-    for f in to_delete:
-        if f.is_dir():
-            _shutil.rmtree(f)
-        else:
-            f.unlink(missing_ok=True)
+    # Delete files/directories. The daemon may still hold memory-mapped handles
+    # (LanceDB store + LMDB state) that aren't released the instant
+    # `remove_project` returns; `_delete_index_paths` stops the daemon to free
+    # them if a direct delete is blocked.
+    _delete_index_paths(to_delete)
 
     if all_:
         # Remove db_dir if empty and different from cocoindex_dir

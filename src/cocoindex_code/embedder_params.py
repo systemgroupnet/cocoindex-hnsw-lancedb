@@ -23,8 +23,8 @@ __all__ = [
 # Accepted kwargs per provider.  Intentionally minimal — we only expose knobs
 # that users have reason to tune AND that make sense per-side (indexing vs
 # query).  Excluded keys:
-#   - ``normalize_embeddings`` (sentence-transformers): query._l2_to_score
-#     assumes unit vectors.
+#   - ``normalize_embeddings`` (sentence-transformers): the LanceDB cosine
+#     index and score (1 - cosine_distance) assume consistent unit vectors.
 #   - ``encoding_format`` (litellm): litellm_embedder hardcodes "float".
 _ACCEPTED_KWARGS: dict[str, frozenset[str]] = {
     "sentence-transformers": frozenset({"prompt_name"}),

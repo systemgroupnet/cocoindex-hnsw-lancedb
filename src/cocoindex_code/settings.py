@@ -286,13 +286,17 @@ def _reset_host_path_mapping_cache() -> None:
     _host_path_mapping = None
 
 
-_TARGET_SQLITE_DB_NAME = "target_sqlite.db"
+_LANCEDB_DIR_NAME = "lancedb"
 _COCOINDEX_DB_NAME = "cocoindex.db"
 
 
-def target_sqlite_db_path(project_root: Path) -> Path:
-    """Return the path to the vector index SQLite database for a project."""
-    return resolve_db_dir(project_root) / _TARGET_SQLITE_DB_NAME
+def lancedb_dir_path(project_root: Path) -> Path:
+    """Return the path to the LanceDB vector store directory for a project.
+
+    LanceDB stores each table as a ``*.lance`` dataset directory under this
+    folder, so the vector index is a directory rather than a single file.
+    """
+    return resolve_db_dir(project_root) / _LANCEDB_DIR_NAME
 
 
 def cocoindex_db_path(project_root: Path) -> Path:

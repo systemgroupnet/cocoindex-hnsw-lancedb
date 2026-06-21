@@ -6,8 +6,7 @@ from collections.abc import Iterable
 from pathlib import Path, PurePath
 
 import cocoindex as coco
-from cocoindex.connectors import localfs, sqlite
-from cocoindex.connectors.sqlite import Vec0TableDef
+from cocoindex.connectors import lancedb, localfs
 from cocoindex.ops.text import RecursiveSplitter, detect_code_language
 from cocoindex.resources.chunk import Chunk
 from cocoindex.resources.file import FilePathMatcher, PatternFilePathMatcher
@@ -15,12 +14,13 @@ from cocoindex.resources.id import IdGenerator
 from pathspec import GitIgnoreSpec
 
 from .chunking import CHUNKER_REGISTRY
+from .lancedb_store import TABLE_NAME
 from .settings import load_gitignore_spec, load_project_settings
 from .shared import (
     CODEBASE_DIR,
     EMBEDDER,
     INDEXING_EMBED_PARAMS,
-    SQLITE_DB,
+    LANCE_DB,
     CodeChunk,
 )
 
@@ -137,7 +137,7 @@ class GitignoreAwareMatcher(FilePathMatcher):
 @coco.fn(memo=True)
 async def process_file(
     file: localfs.File,
-    table: sqlite.TableTarget[CodeChunk],
+    table: lancedb.TableTarget[CodeChunk],
 ) -> None:
     """Process a single file: chunk, embed, and store."""
     embedder = coco.use_context(EMBEDDER)
@@ -201,16 +201,16 @@ async def indexer_main() -> None:
     ps = load_project_settings(project_root)
     gitignore_spec = load_gitignore_spec(project_root)
 
-    table = await sqlite.mount_table_target(
-        db=SQLITE_DB,
-        table_name="code_chunks_vec",
-        table_schema=await sqlite.TableSchema.from_class(
+    # The embedding column's vector dimension is resolved from the EMBEDDER
+    # context annotation on CodeChunk (not hardcoded). LanceDB stores it as a
+    # fixed-size float32 list; the HNSW index over it is built post-indexing by
+    # Project (the CocoIndex LanceDB target manages rows but not ANN indexes).
+    table = await lancedb.mount_table_target(
+        db=LANCE_DB,
+        table_name=TABLE_NAME,
+        table_schema=await lancedb.TableSchema.from_class(
             CodeChunk,
             primary_key=["id"],
-        ),
-        virtual_table_def=Vec0TableDef(
-            partition_key_columns=["language"],
-            auxiliary_columns=["file_path", "content", "start_line", "end_line"],
         ),
     )
 

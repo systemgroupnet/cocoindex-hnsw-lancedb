@@ -14,7 +14,10 @@ import traceback
 from collections.abc import AsyncIterator, Callable
 from multiprocessing.connection import Connection, Listener
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .project import Project
 
 from ._daemon_paths import (
     connection_family,
@@ -26,7 +29,6 @@ from ._daemon_paths import (
 from ._version import __version__
 from .chunking import ChunkerFn as _ChunkerFn
 from .embedder_params import resolve_embedder_params
-from .project import Project
 from .protocol import (
     DaemonEnvRequest,
     DaemonEnvResponse,
@@ -62,9 +64,9 @@ from .settings import (
     format_path_for_display,
     get_host_path_mappings,
     global_settings_mtime_us,
+    lancedb_dir_path,
     load_project_settings,
     load_user_settings,
-    target_sqlite_db_path,
     user_settings_path,
 )
 from .shared import Embedder, check_embedding, create_embedder
@@ -129,6 +131,7 @@ class ProjectRegistry:
 
     _projects: dict[str, Project]
     _embedder: Embedder | None
+    _create_lock: asyncio.Lock
     indexing_params: dict[str, Any]
     query_params: dict[str, Any]
 
@@ -140,6 +143,12 @@ class ProjectRegistry:
     ) -> None:
         self._projects = {}
         self._embedder = embedder
+        # Serializes project creation. `Project.create` now awaits (opening the
+        # async LanceDB connection) before opening the process-global
+        # `coco.Environment`, so without this lock two concurrent first-time
+        # requests for the same root could both miss the cache and race to open
+        # the environment (which permits only one open instance per process).
+        self._create_lock = asyncio.Lock()
         self.indexing_params = dict(indexing_params) if indexing_params else {}
         self.query_params = dict(query_params) if query_params else {}
 
@@ -149,7 +158,21 @@ class ProjectRegistry:
             raise RuntimeError(
                 "Daemon has no global settings loaded. Run `ccc init` to set up cocoindex-code."
             )
-        if project_root not in self._projects:
+        cached = self._projects.get(project_root)
+        if cached is not None:
+            return cached
+        async with self._create_lock:
+            # Double-checked: another coroutine may have created it while we
+            # awaited the lock.
+            cached = self._projects.get(project_root)
+            if cached is not None:
+                return cached
+            # Imported lazily: pulling in Project eagerly would import the
+            # LanceDB connector (pyarrow + lance native, ~13s) at daemon
+            # startup, delaying socket creation. Deferring it to the first
+            # project request keeps daemon launch fast.
+            from .project import Project
+
             root = Path(project_root)
             project_settings = load_project_settings(root)
             chunker_registry = _resolve_chunker_registry(project_settings.chunkers)
@@ -161,7 +184,7 @@ class ProjectRegistry:
                 chunker_registry=chunker_registry,
             )
             self._projects[project_root] = project
-        return self._projects[project_root]
+            return project
 
     def remove_project(self, project_root: str) -> bool:
         """Remove a project from the registry. Returns True if it was loaded."""
@@ -425,33 +448,40 @@ async def _check_file_walk(project_root_str: str) -> DoctorCheckResult:
 
 
 async def _check_index_status(project_root_str: str) -> DoctorCheckResult:
-    """Check index status by querying target_sqlite.db directly."""
-    from cocoindex.connectors import sqlite as coco_sqlite
+    """Check index status by reading the LanceDB store directly."""
+    from cocoindex.connectors import lancedb as coco_lancedb
+
+    from .lancedb_store import TABLE_NAME, VECTOR_COLUMN
 
     project_root = Path(project_root_str)
-    db_path = target_sqlite_db_path(project_root)
-    details = [f"Index: {format_path_for_display(db_path)}"]
+    db_dir = lancedb_dir_path(project_root)
+    details = [f"Index: {format_path_for_display(db_dir)}"]
 
-    if not db_path.exists():
+    if not db_dir.exists():
         details.append("Index not created yet.")
         return DoctorCheckResult(name="Index Status", ok=True, details=details, errors=[])
 
     try:
-        conn = coco_sqlite.connect(str(db_path), load_vec=True)
+        conn = await coco_lancedb.connect_async(str(db_dir))
         try:
-            with conn.readonly() as db:
-                total_chunks = db.execute("SELECT COUNT(*) FROM code_chunks_vec").fetchone()[0]
-                file_rows = db.execute("SELECT DISTINCT file_path FROM code_chunks_vec").fetchall()
-                total_files = len(file_rows)
-                lang_rows = db.execute(
-                    "SELECT language, COUNT(*) FROM code_chunks_vec GROUP BY language"
-                ).fetchall()
-                languages = {row[0]: row[1] for row in lang_rows}
-        finally:
-            conn.close()
+            table = await conn.open_table(TABLE_NAME)
+        except (FileNotFoundError, ValueError):
+            details.append("Index not created yet.")
+            return DoctorCheckResult(name="Index Status", ok=True, details=details, errors=[])
+
+        total_chunks = await table.count_rows()
+        rows = await table.query().select(["file_path", "language"]).to_list()
+        languages: dict[str, int] = {}
+        files: set[str] = set()
+        for row in rows:
+            files.add(row["file_path"])
+            languages[row["language"]] = languages.get(row["language"], 0) + 1
+        has_hnsw = any(VECTOR_COLUMN in idx.columns for idx in await table.list_indices())
+        conn.close()
 
         details.append(f"Chunks: {total_chunks}")
-        details.append(f"Files: {total_files}")
+        details.append(f"Files: {len(files)}")
+        details.append(f"Vector index: {'HNSW' if has_hnsw else 'flat (exact, small index)'}")
         if languages:
             details.append("Languages:")
             for lang, count in sorted(languages.items(), key=lambda x: -x[1]):
@@ -487,6 +517,14 @@ async def _dispatch(
             project = await registry.get_project(req.project_root)
             await project.ensure_indexing_started()
 
+            # Refresh before searching only when the index is idle. If a pass is
+            # already in flight (e.g. an explicit `ccc index` or the initial
+            # background index), skip the refresh and read the current table
+            # directly — LanceDB serves reads concurrently with in-flight
+            # writes, so a search must not block behind the index lock.
+            if req.refresh and not project.is_indexing:
+                await project.refresh_index()
+
             if project.should_wait_for_indexing:
                 return _search_with_wait(project, req)
 
@@ -507,7 +545,7 @@ async def _dispatch(
         if isinstance(req, ProjectStatusRequest):
             project = await registry.get_project(req.project_root)
             await project.ensure_indexing_started()
-            return project.get_status()
+            return await project.get_status()
 
         if isinstance(req, DaemonStatusRequest):
             return DaemonStatusResponse(

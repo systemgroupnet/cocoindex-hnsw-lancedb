@@ -705,7 +705,7 @@ embedding:
 
 ### Custom Database Location
 
-By default, index databases (`cocoindex.db` and `target_sqlite.db`) live alongside settings in `<project>/.cocoindex_code/`. When running in Docker, you may want the databases on the container's native filesystem for performance (LMDB doesn't work well on mounted volumes) while keeping the source code and settings on a mounted volume.
+By default, the index databases live alongside settings in `<project>/.cocoindex_code/`: `cocoindex.db` (the LMDB incremental-indexing state) and `lancedb/` (the LanceDB vector store directory). When running in Docker, you may want the databases on the container's native filesystem for performance (LMDB doesn't work well on mounted volumes) while keeping the source code and settings on a mounted volume.
 
 Set `COCOINDEX_CODE_DB_PATH_MAPPING` to remap database locations by path prefix:
 
@@ -723,32 +723,24 @@ COCOINDEX_CODE_DB_PATH_MAPPING=/workspace=/db-files,/workspace2=/db-files2
 
 Both source and target must be absolute paths. If no mapping matches, the default location is used.
 
+## Vector Search Backend (LanceDB + HNSW)
+
+Chunk embeddings are stored in an embedded **[LanceDB](https://lancedb.github.io/lancedb/)** table (`lancedb/code_chunks.lance` under your index directory). LanceDB runs in-process — no separate server — so the tool stays zero-config, while supporting concurrent reads for the MCP server.
+
+**Approximate nearest-neighbour (HNSW).** Once a codebase grows past a few hundred chunks, the embedding column is indexed with an **HNSW graph using cosine distance**. HNSW makes query latency *sublinear* in codebase size, versus the previous exact brute-force scan that grew linearly. The index is built automatically after indexing and maintained incrementally on subsequent updates.
+
+- **Small indexes** (below 256 chunks) skip the ANN index entirely and use LanceDB's exact flat scan — it's already fast at that size and avoids approximation.
+- **HNSW is approximate**, so recall is < 100%. The defaults (`m=20`, `ef_construction=300`, query-time `ef=256`) favor recall for typical top-k code search. These live in `cocoindex_code/lancedb_store.py`; raise `ef` for more recall, lower it for less latency.
+
+**Scoring.** Results carry a `score` that is cosine similarity (`1 − cosine_distance`), in the same `0..1`-is-better range as before (1.0 = identical).
+
+**Filtering parity and one delta.** Language filters (`--lang`) are exact matches. Path filters (`--path`) accept the same `*` / `?` GLOB wildcards as before — these are translated to LanceDB's SQL `LIKE` (`*`→`%`, `?`→`_`). The one behavioral delta from the old sqlite-vec backend: GLOB character classes (e.g. `[abc]`) are **not** supported and are treated as literal text.
+
+**Re-indexing.** Switching embedding models (different vector dimensions) requires a rebuild: `ccc reset && ccc index`. Vectors are re-exported from source — there's no in-place migration of raw vectors.
+
 ## Troubleshooting
 
 Run `ccc doctor` to diagnose common issues. It checks your settings, daemon health, embedding model, file matching, and index status — all in one command.
-
-### `sqlite3.Connection object has no attribute enable_load_extension`
-
-Some Python installations (e.g. the one pre-installed on macOS) ship with a SQLite library that doesn't enable extensions.
-
-**macOS fix:** Install Python through [Homebrew](https://brew.sh/):
-
-```bash
-brew install python3
-```
-
-Then re-install cocoindex-code (see [Get Started](#get-started--zero-config-lets-go) for install options):
-
-Using pipx:
-```bash
-pipx install cocoindex-code       # first install
-pipx upgrade cocoindex-code       # upgrade
-```
-
-Using uv (install or upgrade):
-```bash
-uv tool install --upgrade cocoindex-code
-```
 
 ### `MDB_MAP_FULL: Environment mapsize limit reached`
 

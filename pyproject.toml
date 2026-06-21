@@ -23,8 +23,7 @@ classifiers = [
 
 dependencies = [
     "mcp>=1.0.0",
-    "cocoindex[litellm]>=1.0.6,<1.1.0",
-    "sqlite-vec>=0.1.0",
+    "cocoindex[lancedb,litellm]>=1.0.7,<1.1.0",
     "pydantic>=2.0.0",
     "numpy>=1.24.0",
     "einops>=0.8.2",

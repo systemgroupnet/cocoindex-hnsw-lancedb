@@ -1,147 +1,145 @@
-"""Query implementation for codebase search."""
+"""Query implementation for codebase search (LanceDB / HNSW backend)."""
 
 from __future__ import annotations
 
-import heapq
-import sqlite3
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from .lancedb_store import (
+    DEFAULT_EF_SEARCH,
+    DISTANCE_TYPE,
+    TABLE_NAME,
+    score_from_distance,
+)
 from .schema import QueryResult
-from .shared import EMBEDDER, QUERY_EMBED_PARAMS, SQLITE_DB
+from .shared import EMBEDDER, LANCE_DB, QUERY_EMBED_PARAMS
+
+if TYPE_CHECKING:
+    from lancedb.table import AsyncTable
 
 
-def _l2_to_score(distance: float) -> float:
-    """Convert L2 distance to cosine similarity (exact for unit vectors)."""
-    return 1.0 - distance * distance / 2.0
+def _sql_str_literal(value: str) -> str:
+    """Quote a string as a SQL literal, escaping embedded single quotes."""
+    escaped = value.replace("'", "''")
+    return f"'{escaped}'"
 
 
-def _knn_query(
-    conn: sqlite3.Connection,
-    embedding_bytes: bytes,
-    k: int,
-    language: str | None = None,
-) -> list[tuple[Any, ...]]:
-    """Run a vec0 KNN query, optionally constrained to a language partition."""
-    if language is not None:
-        return conn.execute(
-            """
-            SELECT file_path, language, content, start_line, end_line, distance
-            FROM code_chunks_vec
-            WHERE embedding MATCH ? AND k = ? AND language = ?
-            ORDER BY distance
-            """,
-            (embedding_bytes, k, language),
-        ).fetchall()
-    return conn.execute(
-        """
-        SELECT file_path, language, content, start_line, end_line, distance
-        FROM code_chunks_vec
-        WHERE embedding MATCH ? AND k = ?
-        ORDER BY distance
-        """,
-        (embedding_bytes, k),
-    ).fetchall()
+def _glob_to_like(pattern: str) -> str:
+    """Translate a shell GLOB path pattern into a SQL ``LIKE`` pattern.
+
+    The sqlite-vec path filtered with ``file_path GLOB ?``; LanceDB's filter is
+    SQL (DataFusion), which has no ``GLOB`` but does have ``LIKE``. We map:
+
+    * ``*`` -> ``%`` (match any run of characters, including ``/`` — same as
+      sqlite GLOB, so ``lib/*`` still matches ``lib/sub/x.py``)
+    * ``?`` -> ``_`` (match a single character)
+
+    Literal ``%`` / ``_`` / ``\\`` in the pattern are escaped so they aren't
+    treated as wildcards (``LIKE ... ESCAPE '\\'``). GLOB character classes
+    (``[...]``) are not supported by ``LIKE`` and are left as literal text;
+    this is the one documented filtering delta from the sqlite-vec backend.
+    """
+    out: list[str] = []
+    for ch in pattern:
+        if ch in ("\\", "%", "_"):
+            out.append("\\" + ch)
+        elif ch == "*":
+            out.append("%")
+        elif ch == "?":
+            out.append("_")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
-def _full_scan_query(
-    conn: sqlite3.Connection,
-    embedding_bytes: bytes,
-    limit: int,
-    offset: int,
-    languages: list[str] | None = None,
-    paths: list[str] | None = None,
-) -> list[tuple[Any, ...]]:
-    """Full scan with SQL-level distance computation and filtering."""
-    conditions: list[str] = []
-    params: list[Any] = [embedding_bytes]
+def _build_filter(
+    languages: list[str] | None,
+    paths: list[str] | None,
+) -> str | None:
+    """Build a LanceDB SQL ``WHERE`` predicate from language/path filters.
+
+    Languages are matched exactly (``language IN (...)``); paths are matched
+    via translated ``LIKE`` patterns OR'd together. Returns ``None`` when no
+    filter applies.
+    """
+    clauses: list[str] = []
 
     if languages:
-        placeholders = ",".join("?" for _ in languages)
-        conditions.append(f"language IN ({placeholders})")
-        params.extend(languages)
+        in_list = ", ".join(_sql_str_literal(lang) for lang in languages)
+        clauses.append(f"language IN ({in_list})")
 
     if paths:
-        path_clauses = " OR ".join("file_path GLOB ?" for _ in paths)
-        conditions.append(f"({path_clauses})")
-        params.extend(paths)
+        like_clauses = " OR ".join(
+            f"file_path LIKE {_sql_str_literal(_glob_to_like(p))} ESCAPE '\\'" for p in paths
+        )
+        clauses.append(f"({like_clauses})")
 
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    params.extend([limit, offset])
-
-    return conn.execute(
-        f"""
-        SELECT file_path, language, content, start_line, end_line,
-               vec_distance_L2(embedding, ?) as distance
-        FROM code_chunks_vec
-        {where}
-        ORDER BY distance
-        LIMIT ? OFFSET ?
-        """,
-        params,
-    ).fetchall()
+    if not clauses:
+        return None
+    return " AND ".join(clauses)
 
 
 async def query_codebase(
     query: str,
-    target_sqlite_db_path: Path,
+    table: AsyncTable,
     env: Any,
     limit: int = 10,
     offset: int = 0,
     languages: list[str] | None = None,
     paths: list[str] | None = None,
+    ef_search: int = DEFAULT_EF_SEARCH,
 ) -> list[QueryResult]:
-    """
-    Perform vector similarity search using vec0 KNN index.
+    """Perform vector similarity search over the LanceDB ``code_chunks`` table.
 
-    Uses sqlite-vec's vec0 virtual table for indexed nearest-neighbor search.
-    Language filtering uses vec0 partition keys for exact index-level filtering.
-    Path filtering triggers a full scan with distance computation.
-    """
-    if not target_sqlite_db_path.exists():
-        raise RuntimeError(
-            f"Index database not found at {target_sqlite_db_path}. "
-            "Please run a query with refresh_index=True first."
-        )
+    Uses LanceDB's vector search, which transparently uses the HNSW index when
+    present and falls back to an exact flat scan otherwise (small codebases).
+    HNSW is approximate: ``ef_search`` widens the graph traversal to trade a
+    little latency for higher recall. Language and path filters are applied as
+    a pre-filter (the predicate is evaluated before the KNN step) so the top-k
+    is taken from the filtered set rather than truncated after the fact.
 
-    db = env.get_context(SQLITE_DB)
+    Scores are cosine similarity (``1 - cosine_distance``), the same scale as
+    the legacy sqlite-vec path.
+    """
     embedder = env.get_context(EMBEDDER)
     query_params = env.get_context(QUERY_EMBED_PARAMS)
 
-    # Generate query embedding.
     query_embedding = await embedder.embed(query, **query_params)
 
-    embedding_bytes = query_embedding.astype("float32").tobytes()
+    search = await table.search(query_embedding.astype("float32"))
+    search = search.distance_type(DISTANCE_TYPE).ef(ef_search)
 
-    with db.readonly() as conn:
-        if paths:
-            rows = _full_scan_query(conn, embedding_bytes, limit, offset, languages, paths)
-        elif not languages or len(languages) == 1:
-            lang = languages[0] if languages else None
-            rows = _knn_query(conn, embedding_bytes, limit + offset, lang)
-        else:
-            fetch_k = limit + offset
-            rows = heapq.nsmallest(
-                fetch_k,
-                (
-                    row
-                    for lang in languages
-                    for row in _knn_query(conn, embedding_bytes, fetch_k, lang)
-                ),
-                key=lambda r: r[5],
-            )
+    predicate = _build_filter(languages, paths)
+    if predicate is not None:
+        search = search.where(predicate)
 
-    if not paths:
-        rows = rows[offset:]
+    # Fetch limit+offset then slice, since pagination here is "skip N then take
+    # M" over a single ranked result set (mirrors the legacy sqlite-vec path).
+    rows = await search.limit(limit + offset).to_list()
+    rows = rows[offset : offset + limit]
 
     return [
         QueryResult(
-            file_path=file_path,
-            language=language,
-            content=content,
-            start_line=start_line,
-            end_line=end_line,
-            score=_l2_to_score(distance),
+            file_path=row["file_path"],
+            language=row["language"],
+            content=row["content"],
+            start_line=row["start_line"],
+            end_line=row["end_line"],
+            score=score_from_distance(row["_distance"]),
         )
-        for file_path, language, content, start_line, end_line, distance in rows
+        for row in rows
     ]
+
+
+async def open_table(env: Any) -> AsyncTable:
+    """Open the LanceDB ``code_chunks`` table from the project's connection.
+
+    Raises ``RuntimeError`` with a user-facing hint when the table does not
+    exist yet (i.e. the project has not been indexed).
+    """
+    conn = env.get_context(LANCE_DB)
+    try:
+        return await conn.open_table(TABLE_NAME)
+    except (FileNotFoundError, ValueError) as e:
+        raise RuntimeError(
+            "Index not found. Please run `ccc index` (or query with refresh) first."
+        ) from e

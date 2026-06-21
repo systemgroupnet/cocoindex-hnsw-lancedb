@@ -14,7 +14,6 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from cocoindex.connectors import sqlite as coco_sqlite
 from conftest import make_test_user_settings
 from typer.testing import CliRunner
 
@@ -31,6 +30,28 @@ from cocoindex_code.settings import (
 )
 
 runner = CliRunner()
+
+
+def _indexed_file_paths(project_root: Path) -> set[str]:
+    """Read the distinct ``file_path`` values from the project's LanceDB table."""
+    import asyncio
+
+    from cocoindex.connectors import lancedb as coco_lancedb
+
+    from cocoindex_code.lancedb_store import TABLE_NAME
+    from cocoindex_code.settings import lancedb_dir_path
+
+    async def _read() -> set[str]:
+        conn = await coco_lancedb.connect_async(str(lancedb_dir_path(project_root)))
+        try:
+            table = await conn.open_table(TABLE_NAME)
+            rows = await table.query().select(["file_path"]).to_list()
+            return {row["file_path"] for row in rows}
+        finally:
+            conn.close()
+
+    return asyncio.run(_read())
+
 
 SAMPLE_MAIN_PY = '''\
 """Main application entry point."""
@@ -242,7 +263,7 @@ def test_session_reset_databases(e2e_project: Path) -> None:
 
     # DB files should be gone
     assert not (e2e_project / ".cocoindex_code" / "cocoindex.db").exists()
-    assert not (e2e_project / ".cocoindex_code" / "target_sqlite.db").exists()
+    assert not (e2e_project / ".cocoindex_code" / "lancedb").exists()
 
     # Restart daemon to fully release LMDB handles.
     # On free-threaded Python (3.14t), deferred refcounting in the daemon
@@ -328,15 +349,7 @@ def test_session_respects_gitignore(e2e_project: Path) -> None:
     result = runner.invoke(app, ["index"], catch_exceptions=False)
     assert result.exit_code == 0, result.output
 
-    db_path = e2e_project / ".cocoindex_code" / "target_sqlite.db"
-    conn = coco_sqlite.connect(str(db_path), load_vec=True)
-    try:
-        with conn.readonly() as db:
-            file_paths = {
-                row[0] for row in db.execute("SELECT DISTINCT file_path FROM code_chunks_vec")
-            }
-    finally:
-        conn.close()
+    file_paths = _indexed_file_paths(e2e_project)
 
     assert "ignored.py" not in file_paths
     assert "ignored_dir/nested.py" not in file_paths
@@ -933,9 +946,9 @@ def test_session_db_path_mapping(
     assert result.exit_code == 0, result.output
 
     # Databases should be in the mapped directory
-    assert (mapped_db_dir / "target_sqlite.db").exists()
+    assert (mapped_db_dir / "lancedb").exists()
     # Databases should NOT be in the project's .cocoindex_code dir
-    assert not (project_dir / ".cocoindex_code" / "target_sqlite.db").exists()
+    assert not (project_dir / ".cocoindex_code" / "lancedb").exists()
 
     # Search should work
     result = runner.invoke(app, ["search", "fibonacci"], catch_exceptions=False)
@@ -945,7 +958,7 @@ def test_session_db_path_mapping(
     # Reset should clean databases from the mapped dir
     result = runner.invoke(app, ["reset", "-f"], catch_exceptions=False)
     assert result.exit_code == 0
-    assert not (mapped_db_dir / "target_sqlite.db").exists()
+    assert not (mapped_db_dir / "lancedb").exists()
     # Settings still in place
     assert (project_dir / ".cocoindex_code" / "settings.yml").exists()
 

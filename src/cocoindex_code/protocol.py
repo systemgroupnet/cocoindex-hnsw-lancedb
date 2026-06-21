@@ -24,6 +24,10 @@ class SearchRequest(_msgspec.Struct, tag="search"):
     paths: list[str] | None = None
     limit: int = 5
     offset: int = 0
+    # Incrementally refresh the index before searching. Honored only when no
+    # index pass is already running; if one is (e.g. an explicit `ccc index`),
+    # the refresh is skipped and the current table is read concurrently.
+    refresh: bool = True
 
 
 class ProjectStatusRequest(_msgspec.Struct, tag="project_status"):

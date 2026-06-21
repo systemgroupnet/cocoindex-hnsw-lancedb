@@ -1,31 +1,21 @@
-# Single-stage image with cache-friendly layer ordering so user `docker pull`s
-# on upgrade only fetch the small per-release layer.
+# Builds cocoindex-code from the LOCAL source tree (the build context) rather
+# than from PyPI. Use this when you have local changes that aren't released yet
+# (e.g. a feature branch). For the PyPI-based release image, see Dockerfile.external.
 #
-# Stable layers (reuse across releases — digest reproducible from the RUN
-# command string + base image, so users keep them in local cache):
-#   1. apt install gosu + create coco user
-#   2. install uv
-#   3. (full only) `uv pip install sentence-transformers` — ~1 GB of torch +
-#      transformers. This is the heavy, slow-changing layer we're optimizing
-#      around.
-#   4. (full only) pre-bake the default embedding model under
-#      /var/cocoindex/cache/... so the named volume's copy-up populates it
-#      on first start without a network fetch.
-#   5. writable-path setup (mkdir /var/cocoindex/db + /var/run/cocoindex_code,
-#      chown to coco) + env vars + entrypoint copy.
+# Layer ordering still favours cache reuse: the heavy, slow-changing layers
+# (gosu/uv/sentence-transformers/baked model) come first and are digest-stable
+# across builds, so only the final source-install layer invalidates when the
+# source tree changes.
 #
-# Per-release layers (invalidate when the source tree changes):
-#   6. COPY . /ccc-src — build context (~MB).
-#   7. `uv pip install "cocoindex>=..." "${CCC_INSTALL_SPEC}"` — installs
-#      cocoindex + cocoindex-code + any of their deps not already in place
-#      from layer 3. Per-release layer size is bounded by what cocoindex +
-#      cocoindex-code + their non-ST deps actually occupy (~tens of MB).
+# `cocoindex` itself (the upstream dependency) still resolves from PyPI — it
+# ships pre-built Rust wheels. What's built locally here is THIS repo's
+# `cocoindex-code` package, via a PEP 517 build from the bind-mounted tree.
 #
-# Two image variants are published per release:
-#   - slim (default, `:latest`) — ~450 MB. Layer 3 is a no-op; cocoindex-code's
-#     LiteLLM deps install in layer 7.
-#   - full (`:full`)             — ~5 GB. Layer 3 + Layer 4 bundle torch +
-#     sentence-transformers + a baked model for offline-ready local embeddings.
+# Two variants, matching Dockerfile.external:
+#   - slim (default) — ~450 MB. cocoindex-code's LiteLLM deps install in the
+#     final layer.
+#   - full           — ~5 GB. Bundles torch + sentence-transformers + a baked
+#     default embedding model for offline-ready local embeddings.
 #
 # Use slim (glibc-based) — cocoindex ships pre-built Rust wheels that need glibc.
 # Alpine / musl-libc would require building from source.
@@ -44,8 +34,7 @@ RUN apt-get update \
 RUN pip install --quiet uv
 
 # Heavy, stable deps for full variant. Layer digest is reproducible across
-# releases (RUN command string is constant), so users skip re-downloading
-# this layer on upgrade.
+# builds (RUN command string is constant), so this layer stays cached.
 ARG CCC_VARIANT=slim
 RUN if [ "$CCC_VARIANT" = "full" ]; then \
         uv pip install --system sentence-transformers; \
@@ -81,24 +70,16 @@ COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 
-# ─── Per-release layer (last so only this one invalidates per release) ─────
+# ─── Per-release layer (last so only this one invalidates per build) ───────
 #
-# Default (PyPI flow): install cocoindex-code from PyPI, picking the extras
-# that match CCC_VARIANT.
-# Release workflow / local tests override with (respectively):
-#   --build-arg CCC_INSTALL_SPEC=/ccc-src
-#   --build-arg CCC_INSTALL_SPEC=/ccc-src[full]
-# to install from the source tree. `rw=true` on the bind mount gives
-# hatch-vcs a writable overlay for `_version.py` during the PEP 517 build;
-# the overlay is discarded after the RUN, so the source tree doesn't
-# persist as a layer in the final image.
-ARG CCC_INSTALL_SPEC=""
+# Install cocoindex-code from the bind-mounted local source tree. The extras
+# match CCC_VARIANT (slim → no extras, full → [full]). `rw=true` on the bind
+# mount gives hatch-vcs a writable overlay for `_version.py` during the
+# PEP 517 build; the overlay is discarded after the RUN, so the source tree
+# doesn't persist as a layer in the final image.
 RUN --mount=type=bind,source=.,target=/ccc-src,rw=true \
-    if [ -z "$CCC_INSTALL_SPEC" ]; then \
-        if [ "$CCC_VARIANT" = "full" ]; then \
-            CCC_INSTALL_SPEC="cocoindex-code[full]"; \
-        else \
-            CCC_INSTALL_SPEC="cocoindex-code"; \
-        fi; \
-    fi; \
-    uv pip install --system "${CCC_INSTALL_SPEC}"
+    if [ "$CCC_VARIANT" = "full" ]; then \
+        uv pip install --system "/ccc-src[full]"; \
+    else \
+        uv pip install --system "/ccc-src"; \
+    fi

@@ -294,9 +294,15 @@ def search(
     paths: list[str] | None = None,
     limit: int = 5,
     offset: int = 0,
+    refresh: bool = True,
     on_waiting: Callable[[], None] | None = None,
 ) -> SearchResponse:
     """Search the codebase.
+
+    When *refresh* is set, the daemon incrementally updates the index before
+    searching — but only if no index pass is already running. If one is (e.g.
+    an explicit ``ccc index``), the refresh is skipped and the current table is
+    read concurrently.
 
     If the daemon sends ``IndexWaitingNotice`` (load-time indexing in
     progress), calls *on_waiting* (if provided) then continues reading
@@ -314,6 +320,7 @@ def search(
                     paths=paths,
                     limit=limit,
                     offset=offset,
+                    refresh=refresh,
                 )
             )
         )

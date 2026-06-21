@@ -12,9 +12,12 @@ from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, Union
 import cocoindex as coco
 import numpy as np
 import numpy.typing as npt
-from cocoindex.connectors import sqlite
 
 if TYPE_CHECKING:
+    # Referenced as a string forward-ref in the LANCE_DB ContextKey below; the
+    # connector itself must not be imported at runtime here (it pulls in
+    # pyarrow/lance, a multi-second import on a hot startup path).
+    from cocoindex.connectors.lancedb import LanceAsyncConnection  # noqa: F401
     from cocoindex.ops.litellm import LiteLLMEmbedder
     from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
 
@@ -30,7 +33,7 @@ Embedder = Union["SentenceTransformerEmbedder", "LiteLLMEmbedder"]
 
 # Context keys
 EMBEDDER = coco.ContextKey[Embedder]("embedder", detect_change=True)
-SQLITE_DB = coco.ContextKey[sqlite.ManagedConnection]("index_db")
+LANCE_DB = coco.ContextKey["LanceAsyncConnection"]("index_db")
 CODEBASE_DIR = coco.ContextKey[pathlib.Path]("codebase")
 INDEXING_EMBED_PARAMS = coco.ContextKey[dict[str, Any]]("indexing_embed_params")
 QUERY_EMBED_PARAMS = coco.ContextKey[dict[str, Any]]("query_embed_params")
@@ -138,7 +141,7 @@ def create_embedder(
 
 @dataclass
 class CodeChunk:
-    """Schema for storing code chunks in SQLite."""
+    """Schema for a code chunk row in the LanceDB vector store."""
 
     id: int
     file_path: str

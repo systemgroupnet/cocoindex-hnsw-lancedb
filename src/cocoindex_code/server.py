@@ -123,8 +123,9 @@ def create_mcp_server(project_root: str) -> FastMCP:
 
         loop = asyncio.get_event_loop()
         try:
-            if refresh_index:
-                await loop.run_in_executor(None, lambda: _client.index(project_root))
+            # The daemon refreshes the index before searching when idle; while
+            # an index pass is already running it reads the current table
+            # concurrently rather than blocking behind the index lock.
             resp = await loop.run_in_executor(
                 None,
                 lambda: _client.search(
@@ -134,6 +135,7 @@ def create_mcp_server(project_root: str) -> FastMCP:
                     paths=paths,
                     limit=limit,
                     offset=offset,
+                    refresh=refresh_index,
                 ),
             )
             return SearchResultModel(
