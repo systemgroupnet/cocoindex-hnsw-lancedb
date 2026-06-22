@@ -1,15 +1,12 @@
 #!/usr/bin/env pwsh
-# Builds docker/Dockerfile and tags the image cocoindex-code-lance-hsnw:0.0.1.
-#
-# Run from anywhere — the script resolves paths relative to its own location so
-# the build context is the project root (the Dockerfile COPYs docker/entrypoint.sh
-# and bind-mounts the whole tree, so the context must be the repo root, not docker/).
+
+$Version = "0.0.12"
 
 $ErrorActionPreference = 'Stop'
 
 $ProjectRoot = $PSScriptRoot
 $Dockerfile  = Join-Path $ProjectRoot 'docker/Dockerfile'
-$Tag         = 'registries.mars.abramad.com/mars/aid/cocoindex-code-lance-hsnw:0.0.2'
+$Tag         = 'registries.mars.abramad.com/mars/aid/cocoindex-code-lance-hsnw:' + $Version
 
 # BuildKit is required for the `--mount=type=bind,...,rw=true` in the final layer.
 $env:DOCKER_BUILDKIT = '1'

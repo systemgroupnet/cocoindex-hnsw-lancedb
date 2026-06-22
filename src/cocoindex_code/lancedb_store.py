@@ -8,10 +8,11 @@ between the indexer that writes the table and the query path that reads it.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from lancedb.table import AsyncTable
+    from lancedb.table import AsyncTable, OptimizeStats
 
 # Table layout ---------------------------------------------------------------
 
@@ -45,6 +46,15 @@ DEFAULT_EF_SEARCH = 256
 # handful of vectors only adds overhead. At/above it we build the HNSW graph so
 # query latency stays sublinear as the codebase grows.
 INDEX_MIN_ROWS = 256
+
+# Retention for the prune run after each index pass. LanceDB is append-only: every
+# merge_insert and every compaction writes new files and keeps the superseded ones
+# as historical versions. Its built-in prune only reclaims versions older than 7
+# days, so high-churn indexing (amplified by refresh-on-search) balloons the store
+# to tens of GB. Pruning to a short retention each run reclaims that bloat while
+# leaving a safety window for in-flight concurrent read snapshots (a search opens a
+# version and reads it in well under a second; the latest version is never removed).
+POST_INDEX_RETENTION = timedelta(minutes=10)
 
 
 def score_from_distance(distance: float) -> float:
@@ -90,3 +100,28 @@ async def ensure_vector_index(table: AsyncTable) -> bool:
         replace=True,
     )
     return True
+
+
+async def prune_old_versions(
+    table: AsyncTable,
+    *,
+    cleanup_older_than: timedelta = POST_INDEX_RETENTION,
+    delete_unverified: bool = False,
+) -> OptimizeStats:
+    """Compact small files and prune superseded versions to reclaim disk.
+
+    Wraps ``table.optimize`` and returns its :class:`~lancedb.table.OptimizeStats`
+    (``compaction`` fragment counts + ``prune`` bytes/old-versions removed) so
+    callers can log exactly what was reclaimed instead of flying blind.
+
+    With the default :data:`POST_INDEX_RETENTION` this is safe to run after every
+    index pass alongside concurrent reads. For a one-time aggressive reclaim (see
+    ``ccc compact``), pass ``cleanup_older_than=timedelta(0)`` to drop every
+    version but the latest and ``delete_unverified=True`` to also remove files
+    orphaned by interrupted runs — only do that when no index pass is writing
+    concurrently.
+    """
+    return await table.optimize(
+        cleanup_older_than=cleanup_older_than,
+        delete_unverified=delete_unverified,
+    )

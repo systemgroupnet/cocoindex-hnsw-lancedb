@@ -56,6 +56,7 @@ async def test_indexing_params_forwarded_to_embed(tmp_path: Path) -> None:
     project = await Project.create(
         project_root,
         cast(Embedder, stub),
+        cast(Embedder, stub),
         indexing_params={"prompt_name": "passage"},
         query_params={"prompt_name": "query"},
     )
@@ -81,6 +82,7 @@ async def test_query_params_forwarded_to_embed(tmp_path: Path) -> None:
     stub = _KwargRecordingEmbedder()
     project = await Project.create(
         project_root,
+        cast(Embedder, stub),
         cast(Embedder, stub),
         indexing_params={"prompt_name": "passage"},
         query_params={"prompt_name": "query"},

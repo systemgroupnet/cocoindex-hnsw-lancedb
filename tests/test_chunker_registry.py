@@ -52,6 +52,7 @@ async def _index_project(
     project = await Project.create(
         project_root,
         stub,
+        stub,
         indexing_params={},
         query_params={},
         **create_kwargs,

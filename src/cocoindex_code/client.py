@@ -26,6 +26,8 @@ from ._daemon_paths import (
 )
 from ._version import __version__
 from .protocol import (
+    CompactRequest,
+    CompactResponse,
     DaemonEnvRequest,
     DaemonEnvResponse,
     DaemonStatusResponse,
@@ -364,6 +366,15 @@ def stop() -> StopResponse:
 def daemon_env() -> DaemonEnvResponse:
     """Get environment variable names from the daemon."""
     return _send(DaemonEnvRequest())  # type: ignore[return-value]
+
+
+def compact(project_root: str) -> CompactResponse:
+    """Reclaim disk by compacting the index and pruning all old versions.
+
+    May take a while on a large store; the daemon holds the project's index
+    lock for the duration, so no index pass writes concurrently.
+    """
+    return _send(CompactRequest(project_root=normalize_input_path(project_root)))  # type: ignore[return-value]
 
 
 def doctor(

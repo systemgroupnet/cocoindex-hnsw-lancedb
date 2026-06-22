@@ -1,0 +1,676 @@
+ ▐▛███▜▌   Claude Code v2.1.183
+▝▜█████▛▘  Opus 4.8 · Claude Pro
+  ▘▘ ▝▝    E:\ai\projects\cocoindex-code
+
+
+❯ /clear                                                                        
+
+❯ while indexing via `ccc index`, the mcp server no longer responds to queries. 
+  why is that?                                                                  
+
+● Let me dig into the code to understand how indexing and the MCP server
+  interact.
+
+  Read 1 file, recalled 1 memory (ctrl+o to expand)
+
+● Now let me look at the Project class, which holds the indexing/search
+  coordination logic.
+
+  Read 1 file (ctrl+o to expand)
+
+● This is a coordination question. Let me look at the search/index path more
+  closely, plus the MCP server and how it talks to the daemon.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Let me look at the MCP server to see how it sends requests and how the
+  embedder is invoked.
+
+  Read 1 file (ctrl+o to expand)
+
+● Found it. Let me confirm the client's index call is a blocking,
+  run-to-completion call.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● The cause is in the MCP search tool's default behavior, not in the search path
+  itself.
+
+  What happens
+
+  When you run ccc index, the daemon spawns an index task that grabs
+  Project._index_lock and holds it for the whole run (project.py:84, run_index).
+
+  Meanwhile, the MCP search tool defaults refresh_index=True (server.py:101). So
+  every query refreshes the index before searching:
+
+  if refresh_index:
+      await loop.run_in_executor(None, lambda: _client.index(project_root))   # 
+  server.py:127
+  resp = await loop.run_in_executor(None, lambda: _client.search(...))        # 
+  server.py:128
+
+  _client.index is a blocking call that streams until the index run completes
+  (client.py:262, "Blocks until complete"). On the daemon side that request goes
+  through stream_index, which always spawns its own index task
+  (project.py:189), and that task immediately does async with self._index_lock:
+  (project.py:84).
+
+  Since ccc index is already holding that lock, the MCP-triggered refresh blocks
+  waiting to acquire it. The lock isn't released until ccc index finishes — so
+  the MCP query hangs for the entire duration of indexing. The search query is
+  never even reached; it's the refresh-before-search that's stuck behind the
+  lock.
+
+  Secondary contributor (first index only)
+
+  Even with refresh_index=False, the very first index blocks searches by design:
+  should_wait_for_indexing returns not _initial_index_done.is_set()
+  (project.py:216), so _dispatch routes the search through _search_with_wait →
+  wait_for_indexing_done() → await _initial_index_done.wait() (daemon.py:520,
+  project.py:218). Once the first index has ever completed, this flag stays set,
+  so this path no longer blocks re-indexes — but the refresh_index=True path
+  above still does.
+
+  So, in short
+
+  The MCP server isn't crashing — each query is serializing behind the index
+  lock because it tries to refresh the index first, and that refresh can't
+  proceed until ccc index releases the lock.
+
+  If you want queries to stay responsive during indexing
+
+  A few options, depending on intent:
+
+  1. Quick mitigation: call the MCP search tool with refresh_index=False.
+  Queries then hit the existing (possibly slightly stale) index and return
+  immediately — assuming the project has been indexed at least once.
+  2. Make refresh non-blocking when an index is already in flight: in
+  stream_index, if _index_lock.locked() (or _indexing_scheduled), don't spawn a
+  second pass that waits on the lock — just return immediately (the in-flight
+  ccc index already covers the refresh). This mirrors the existing "never spawn
+  a competing index" intent noted for searches.
+  3. Let reads run concurrently with writes: LanceDB supports concurrent readers
+  during writes, so a read-only search could be allowed to proceed even while
+  indexing — the blocker here is purely the refresh-acquires-lock step, not
+  LanceDB.
+
+  Want me to implement option 2 (skip the redundant refresh when an index is
+  already running)?
+
+✻ Worked for 1m 31s
+
+※ recap: You asked why MCP queries hang during `ccc index`: it's because the MCP search tool refreshes the index first (refresh_index=True), blocking on the same index lock. Next action: decide whether I should make the refresh skip when an index is already running.
+
+❯ LanceDB supports concurrent readers during writes, so a read-only search      
+  could be allowed to proceed even while indexing — the blocker here is purely  
+  the refresh-acquires-lock step, not LanceDB. so lets support for concurrent   
+  reads.                                                                        
+
+● Good call. Let me look at the protocol definition for SearchRequest and the
+  CLI's search path so I change all the call sites consistently.
+
+  Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● This is a clean, well-scoped change. The plan:
+
+  1. Daemon search path: read the current table concurrently while an index is
+  in flight; only refresh when idle, only wait on a true cold start.
+  2. Fold refresh into SearchRequest so the MCP tool stops issuing a separate
+  blocking _client.index() before every query.
+  3. Add Project.is_indexing + Project.refresh_index().
+
+  Let me make the edits.
+
+● Update(src\cocoindex_code\protocol.py)
+  ⎿  File must be read first
+
+● I need to read the files before editing them.
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(src\cocoindex_code\protocol.py)
+  ⎿  Added 4 lines
+      24      paths: list[str] | None = None
+      25      limit: int = 5
+      26      offset: int = 0
+      27 +    # Incrementally refresh the index before searching. Honored
+         + only when no                                                  
+      28 +    # index pass is already running; if one is (e.g. an explici
+         +t `ccc index`),                                                
+      29 +    # the refresh is skipped and the current table is read conc
+         +urrently.                                                      
+      30 +    refresh: bool = True                                       
+      31  
+      32  
+      33  class ProjectStatusRequest(_msgspec.Struct, tag="project_status
+          "):
+
+● Now client.search — add the refresh param:
+
+● Update(src\cocoindex_code\client.py)
+  ⎿  Added 7 lines
+      294      paths: list[str] | None = None,
+      295      limit: int = 5,
+      296      offset: int = 0,
+      297 +    refresh: bool = True,                                     
+      298      on_waiting: Callable[[], None] | None = None,
+      299  ) -> SearchResponse:
+      300      """Search the codebase.
+      301  
+      302 +    When *refresh* is set, the daemon incrementally updates th
+          +e index before                                                
+      303 +    searching — but only if no index pass is already running. 
+          +If one is (e.g.                                               
+      304 +    an explicit ``ccc index``), the refresh is skipped and the
+          + current table is                                             
+      305 +    read concurrently.                                        
+      306 +                                                              
+      307      If the daemon sends ``IndexWaitingNotice`` (load-time inde
+           xing in
+      308      progress), calls *on_waiting* (if provided) then continues
+            reading
+      309      until the final ``SearchResponse``.
+     ...
+      320                      paths=paths,
+      321                      limit=limit,
+      322                      offset=offset,
+      323 +                    refresh=refresh,                          
+      324                  )
+      325              )
+      326          )
+● Now Project: add is_indexing and refresh_index:
+
+● Update(src\cocoindex_code\project.py)
+  ⎿  Added 24 lines
+      157          task.add_done_callback(_clear)
+      158          return task
+      159  
+      160 +    @property                                                 
+      161 +    def is_indexing(self) -> bool:                            
+      162 +        """True if an index pass is running or scheduled to ru
+          +n imminently.                                                 
+      163 +                                                              
+      164 +        Covers both the window after a task is created but bef
+          +ore it acquires                                               
+      165 +        the lock (``_indexing_scheduled``) and the window whil
+          +e it holds the                                                
+      166 +        lock. Used to decide whether a search should refresh t
+          +he index or read                                              
+      167 +        the current table concurrently.                       
+      168 +        """                                                   
+      169 +        return self._index_lock.locked() or self._indexing_sch
+          +eduled                                                        
+      170 +                                                              
+      171 +    async def refresh_index(self) -> None:                    
+      172 +        """Run an incremental index pass and wait for it to fi
+          +nish.                                                         
+      173 +                                                              
+      174 +        Spawned as an independent task (rather than awaited in
+          +line) so a client                                             
+      175 +        disconnect cancelling the request handler does not abo
+          +rt the indexing                                               
+      176 +        mid-write; the handle is then awaited for completion. 
+      177 +                                                              
+      178 +        Callers must check :attr:`is_indexing` first and skip 
+          +this when an index                                            
+      179 +        is already in flight — otherwise this queues a redunda
+          +nt second pass                                                
+      180 +        behind the lock instead of reading concurrently.      
+      181 +        """                                                   
+      182 +        await self._spawn_index()                             
+      183 +                                                              
+      184      async def ensure_indexing_started(self) -> None:
+      185          """Kick off background indexing and wait until it has 
+           actually started.
+      186  
+
+● Now the daemon dispatch for SearchRequest:
+
+● Update(src\cocoindex_code\daemon.py)
+  ⎿  Added 8 lines
+      517              project = await registry.get_project(req.project_r
+           oot)
+      518              await project.ensure_indexing_started()
+      519  
+      520 +            # Refresh before searching only when the index is 
+          +idle. If a pass is                                            
+      521 +            # already in flight (e.g. an explicit `ccc index` 
+          +or the initial                                                
+      522 +            # background index), skip the refresh and read the
+          + current table                                                
+      523 +            # directly — LanceDB serves reads concurrently wit
+          +h in-flight                                                   
+      524 +            # writes, so a search must not block behind the in
+          +dex lock.                                                     
+      525 +            if req.refresh and not project.is_indexing:       
+      526 +                await project.refresh_index()                 
+      527 +                                                              
+      528              if project.should_wait_for_indexing:
+      529                  return _search_with_wait(project, req)
+      530  
+
+● Now the MCP search tool — drop the separate blocking index call, fold refresh
+  into the search request:
+
+● Update(src\cocoindex_code\server.py)
+  ⎿  Added 4 lines, removed 2 lines
+      123  
+      124          loop = asyncio.get_event_loop()
+      125          try:
+      126 -            if refresh_index:                                 
+      127 -                await loop.run_in_executor(None, lambda: _clie
+          -nt.index(project_root))                                       
+      126 +            # The daemon refreshes the index before searching 
+          +when idle; while                                              
+      127 +            # an index pass is already running it reads the cu
+          +rrent table                                                   
+      128 +            # concurrently rather than blocking behind the ind
+          +ex lock.                                                      
+      129              resp = await loop.run_in_executor(
+      130                  None,
+      131                  lambda: _client.search(
+     ...
+      135                      paths=paths,
+      136                      limit=limit,
+      137                      offset=offset,
+      138 +                    refresh=refresh_index,                    
+      139                  ),
+      140              )
+      141              return SearchResultModel(
+
+● Now the CLI's _search_with_wait_spinner — it has its own --refresh handling
+  via _run_index_with_progress, so it must pass refresh=False to avoid a
+  daemon-side double refresh (and to keep the no---refresh default of not
+  refreshing):
+
+● Update(src\cocoindex_code\cli.py)
+  ⎿  Added 4 lines
+      258              paths=paths,
+      259              limit=limit,
+      260              offset=offset,
+      261 +            # The `ccc search --refresh` flag runs its own for
+          +eground index                                                 
+      262 +            # (with progress) before reaching here, so never r
+          +efresh again                                                  
+      263 +            # daemon-side.                                    
+      264 +            refresh=False,                                    
+      265              on_waiting=_on_waiting,
+      266          )
+      267  
+
+● Let me check the test files and any other _client.search/server search call
+  sites, then run mypy and tests.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Let me run mypy and the relevant tests.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● All green. Let me update the project memory to record the new concurrent-read
+  behavior.
+
+  Wrote 1 memory (ctrl+o to expand)
+
+● Done. Concurrent reads now work during indexing. Here's what changed and why.
+
+  The core fix
+
+  The blocker was that the MCP search tool issued a separate, blocking 
+  _client.index() before every query, and that refresh had to acquire the same
+  _index_lock that ccc index was holding. The search query itself was never the
+  problem — LanceDB serves reads during writes.
+
+  So I folded refresh into the search request and made it idle-only:
+
+  SearchRequest now carries refresh: bool (protocol.py). The daemon decides what
+  to do (daemon.py):
+
+  if req.refresh and not project.is_indexing:
+      await project.refresh_index()      # idle: refresh, then read
+  if project.should_wait_for_indexing:
+      return _search_with_wait(project, req)  # cold start only: no table yet
+  results = await project.search(...)    # otherwise: read current table 
+  concurrently
+
+  - During ccc index (or the initial background index): is_indexing is True →
+  skip the refresh → read the current table immediately, concurrent with the
+  in-flight write.
+  - Idle daemon: refresh incrementally first (preserves the old fresh-results
+  semantics).
+  - True cold start (no table exists yet): still waits, since there's nothing to
+  read.
+
+  Supporting changes
+
+  - Project.is_indexing — _index_lock.locked() or _indexing_scheduled.
+  - Project.refresh_index() — spawns the index as an independent task and awaits
+  it, so a client disconnect can't abort a write mid-flight. The is_indexing
+  check → spawn is atomic (no await between them), so two simultaneous searches
+  can't both kick off a refresh.
+  - MCP search tool (server.py) — dropped the separate _client.index() call;
+  passes refresh=refresh_index into the single search request.
+  - CLI ccc search --refresh — unchanged UX: it still runs its own foreground
+  index with progress, so _search_with_wait_spinner passes refresh=False to
+  avoid a daemon-side double refresh.
+
+  Verification
+
+  - mypy clean across all 6 changed modules.
+  - test_query.py, test_e2e_daemon.py, test_embed_params_forwarding.py, and
+  test_e2e.py::test_session_search_refresh all pass.
+
+  Note this is a small semantic shift worth being aware of: a query issued while
+  an index is running now returns results from the last-committed state rather
+  than waiting for the in-progress pass to finish — which is exactly the
+  concurrent-read tradeoff you asked for. The next query (once indexing settles)
+  picks up the fresh data.
+
+✻ Worked for 9m 59s
+
+❯ what happens if `ccc index` is midway indexing? can it search the already     
+  indexed chunks?                                                               
+
+● Good question — the answer depends on LanceDB's commit/version semantics and
+  how CocoIndex flushes writes during a run. Let me check the actual write path
+  rather than guess.
+
+  Read 1 file (ctrl+o to expand)
+
+● The commit granularity of mount_table_target is the key. Let me check the
+  installed CocoIndex LanceDB connector source.
+
+  Searched for 2 patterns, ran 1 shell command (ctrl+o to expand)
+
+● _apply_actions runs merge_insert(...).execute() per mutation batch (line
+  356–470), and each execute() is its own LanceDB transaction/commit. So rows
+  become committed incrementally during a run. Now the other half: does a
+  concurrent reader actually observe those new versions? That depends on whether
+  conn.open_table returns the latest version. Let me check the installed
+  LanceDB.
+
+  Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● Confirmed the mechanics. open_table (db.py:1634) passes no version=, returns a
+  fresh AsyncTable each call → it reads the latest committed manifest at that
+  moment. And the writer side commits incrementally: each _apply_actions batch
+  runs its own merge_insert(...).execute() (_target.py:356–470), which is a
+  separate LanceDB transaction/version. So the two halves line up. Here's the
+  actual answer:
+
+  It depends which case you're in
+
+  The daemon's search dispatch branches on should_wait_for_indexing (= "has an
+  index ever completed in this daemon"):
+
+  1. First-ever index (no prior completed index) → it waits, no partial results
+
+  ccc index is building the table from scratch. should_wait_for_indexing is
+  True, so a search routes to _search_with_wait and blocks until indexing 
+  finishes, then searches the complete table. This is deliberate — at cold start
+  there's no meaningful prior dataset, and mount_table_target only just created
+  an empty table, so partial results would be near-useless. So in this case:
+  no, it doesn't return the half-done chunks; it waits.
+
+  2. Re-index (a prior index already completed) → yes, concurrent live reads
+
+  This is the is_indexing && !should_wait_for_indexing path the new code
+  enables. The search reads the current committed snapshot immediately:
+
+  - LanceDB is MVCC. Each merge_insert batch commits a new version. A fresh
+  open_table per search sees the latest committed version.
+  - So the reader sees the full previous dataset, progressively updated as the
+  re-index commits new/changed chunks. It's a moving target — two searches a
+  second apart during the run can see slightly different data.
+
+  Two details worth knowing for case 2
+
+  Vector index coverage. The HNSW index is built post-indexing
+  (_ensure_vector_index, rows ≥ 256). During a re-index it's whatever the last
+  completed run built. Rows committed since aren't in the HNSW graph yet — but
+  query.py doesn't set fast_search, so LanceDB's default behavior also
+  brute-force-scans the unindexed fragments and merges them in. Results stay
+  complete, just marginally slower for the new portion. (Then
+  _ensure_vector_index rebuilds the HNSW after the run.)
+
+  Churn for changed files. process_file is @coco.fn(memo=True), so unchanged
+  files aren't reprocessed — their chunks stay rock-stable during the re-index.
+  Only changed/removed files churn (old chunks deleted, new inserted), and since
+  merge_insert is atomic per batch, you never see a torn write within a file's
+  batch; across the whole run you might briefly see a mix of old/new chunks
+  across different files.
+
+  TL;DR
+
+  - Re-indexing: yes — searches return already-indexed chunks immediately,
+  reading a live-updating committed snapshot, concurrent with the write.
+  - First index: no — searches wait for it to finish, because there's no prior
+  data to read and the table starts empty.
+✻ Cooked for 2m 9s
+
+❯ is it safe to launch this new version?                                        
+
+● Honest answer: the change is logically sound and the targeted tests pass, but
+  "safe to launch" needs more than what I've verified so far. Let me close the
+  cheap gaps now — full type check and full test suite — before giving you a
+  real assessment.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Here's my honest read. I ran the full suite and full type check.
+
+  What's verified ✓
+
+  - My 6 changed files are type-clean (ran mypy on them directly — no issues).
+  - Full suite: 212 passed, 1 failed, and the failure isn't mine. The failure is
+  test_dockerfile_install_line_uses_full_extra — it checks the Dockerfile for
+  cocoindex-code[full], which broke from the Docker restructure on this branch
+  (the Dockerfile -> Dockerfile.external rename in your git status). Unrelated
+  to concurrent reads.
+  - The 9 mypy errors are all pre-existing branch issues in files I never
+  touched: scripts/find_best_models.py, scripts/benchmark_search.py,
+  tests/test_chunker_registry.py. None in my change.
+
+  So my change adds no new failures and no new type errors.
+
+  What's NOT verified — the real risks ⚠️
+
+  1. No test exercises a search landing during an in-flight index. This is the
+  exact behavior I added, and every test runs search after indexing completes.
+  The logic is traced and sound, but there's zero automated coverage of the
+  concurrent path. That's the gap I'd most want closed before calling it "safe."
+  2. Windows read-during-optimize(). This branch has a documented history of
+  Windows "Access is denied" from concurrent index writes. Concurrent reads
+  should be fine (MVCC), but optimize() runs every 50 batches mid-index and
+  deletes old fragment files — a reader holding a snapshot over those files is a
+  classic Windows file-locking sharp edge I have not actually triggered.
+  LanceDB is designed to handle it via version retention, but "designed to" ≠
+  "tested on your setup."
+  3. Two unrelated red items already gate a release regardless of my change (the
+  Docker test + scripts mypy).
+
+  Verdict
+
+  The change itself is low-risk and correct on paper, but I would not ship it as
+  "verified safe" yet — the headline feature (concurrent search during
+  indexing, including on Windows) has no test and I haven't watched it run for
+  real.
+
+  I'd suggest one or both before launch:
+  - Add a regression test: kick off an index, fire a search while is_indexing is
+  true, assert it returns results without blocking — this also smoke-tests the
+  Windows read/optimize path in CI.
+  - Manual smoke test: start a real ccc index on a largish repo and hit the MCP
+  search mid-run.
+
+  Want me to write the concurrency regression test, or run the manual smoke test
+  against this repo?
+
+✻ Sautéed for 9m 31s
+
+※ recap: Goal: let MCP searches run during `ccc index` (concurrent reads). The code change is done and passes targeted tests, but the concurrent-search-during-index path has no test. Next: write that regression test or run a manual mid-index smoke test.
+
+❯ how to improve speed of this docker instruction " => [2/4] RUN uv pip install 
+  --system -vv -i https://package-mirror.liara.ir/repository/pypi/simple/       
+  mcp-proxy                                                                     
+     9.6s" with mount=type=cache                                                
+
+  Read 1 file (ctrl+o to expand)
+  ⎿  Interrupted · What should Claude do instead?
+
+※ recap: Goal: enable concurrent reads so MCP search responds during `ccc index`. The code change is done and passes existing tests, but the concurrent-search-during-index path has no test coverage. Next: write that regression test or run a manual mid-index search smoke test.
+
+❯ I executed `ccc index`. The index is not finished, but it already has many    
+  chunks and files indexed:                                                     
+  Index stats:                                                                  
+    Chunks: 34941                                                               
+    Files:  1363                                                                
+    Languages:                                                                  
+      text: 22102 chunks                                                        
+      go: 12662 chunks                                                          
+      yaml: 79 chunks                                                           
+      markdown: 55 chunks                                                       
+      html: 37 chunks                                                           
+      json: 6 chunks                                                            
+  But the MCP call for search is not searching on the indexed chunks.           
+
+● That confirms a real bug in my earlier change. The chunks are committed and
+  queryable (your ccc status read them fine — that's a concurrent read working),
+  but the first index is the case I gated too conservatively.
+
+  The problem: my dispatch waits whenever should_wait_for_indexing is true, and
+  that flag is not _initial_index_done.is_set() — i.e. "has an index ever 
+  finished in this daemon." On a first index it's never set, so the search
+  routes to _search_with_wait and blocks until the whole pass completes, even
+  though 34k rows are already there to read.
+
+  The gate should be "is there anything to read right now," not "has a full pass
+  ever completed." Let me fix it.
+
+● Update(src\cocoindex_code\project.py)
+  ⎿  Added 16 lines
+      157          task.add_done_callback(_clear)
+      158          return task
+      159  
+      160 +    async def has_indexed_rows(self) -> bool:                 
+      161 +        """True if the LanceDB table exists and currently hold
+          +s ≥1 row.                                                     
+      162 +                                                              
+      163 +        Lets a search read partial results committed by an in-
+          +flight index —                                                
+      164 +        including the *first* index pass — instead of waiting 
+          +for the whole run                                             
+      165 +        to finish. LanceDB commits chunks incrementally, so ro
+          +ws become                                                     
+      166 +        queryable as indexing progresses; only a genuinely emp
+          +ty/not-yet-created                                            
+      167 +        table should make a search wait.                      
+      168 +        """                                                   
+      169 +        try:                                                  
+      170 +            conn = self._env.get_context(LANCE_DB)            
+      171 +            table = await conn.open_table(TABLE_NAME)         
+      172 +            return await table.count_rows() > 0               
+      173 +        except (FileNotFoundError, ValueError):               
+      174 +            return False                                      
+      175 +                                                              
+      176      @property
+      177      def is_indexing(self) -> bool:
+      178          """True if an index pass is running or scheduled to ru
+           n imminently.
+
+● Update(src\cocoindex_code\daemon.py)
+  ⎿  Added 5 lines, removed 1 line
+      525              if req.refresh and not project.is_indexing:
+      526                  await project.refresh_index()
+      527  
+      528 -            if project.should_wait_for_indexing:              
+      528 +            # Read the current table whenever it already has r
+          +ows — even mid                                                
+      529 +            # index, including during the first index pass (La
+          +nceDB commits                                                 
+      530 +            # chunks incrementally, so they're queryable befor
+          +e the run                                                     
+      531 +            # finishes). Only wait when there is genuinely not
+          +hing to search yet.                                           
+      532 +            if project.should_wait_for_indexing and not await 
+          +project.has_indexed_rows():                                   
+      533                  return _search_with_wait(project, req)
+      534  
+      535              results = await project.search(
+
+● Now type-check and run the daemon/query tests:
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Tests pass; one mypy nit — count_rows() is typed Any, so the comparison leaks
+  Any. Let me make the return explicit.
+
+● Update(src\cocoindex_code\project.py)
+  ⎿  Added 2 lines, removed 1 line
+      169          try:
+      170              conn = self._env.get_context(LANCE_DB)
+      171              table = await conn.open_table(TABLE_NAME)
+      172 -            return await table.count_rows() > 0               
+      172 +            count: int = await table.count_rows()             
+      173 +            return count > 0                                  
+      174          except (FileNotFoundError, ValueError):
+      175              return False
+      176  
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Fixed and type-clean. One critical thing: the running daemon is still 
+  executing the old code — it loaded at launch and won't pick up this change
+  until restarted. So even after my fix, your current session will keep
+  blocking.
+
+  Let me confirm the restart command.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Summary
+
+  You hit a real bug in my earlier change. Your ccc status reading 34,941 chunks
+  proves concurrent reads work at the LanceDB level — the blocker was purely my
+  over-conservative gate.
+
+  The fix: searches now decide whether to wait based on whether the table has 
+  rows right now (has_indexed_rows() → count_rows() > 0), not on whether a full
+  index pass has ever completed. So during a first index, once chunks are
+  committed, searches read them concurrently instead of blocking until the whole
+  run finishes.
+
+  - project.py: added has_indexed_rows().
+  - daemon.py: wait only when should_wait_for_indexing and not await 
+  has_indexed_rows() (the cheap flag short-circuits the row check in the warm
+  case).
+  - mypy clean; test_e2e_daemon.py + test_query.py pass.
+
+  To get it working in your live session
+
+  The running daemon still has the old code — it won't pick this up until
+  restarted:
+
+  ccc daemon restart
+  ccc index
+
+  Two things in your favor:
+  - The 34,941 chunks are already committed to LanceDB on disk, so they survive
+  the restart.
+  - process_file is memoized via the on-disk cocoindex LMDB, so the re-run skips
+  already-processed files and continues where it left off — it won't redo
+  everything.
+
+  After that, an MCP search mid-index will return results against whatever's
+  committed so far.
+
+  ⚠️ Caveat from before still stands: this concurrent-read-during-first-index
+  path now has no automated test, and I haven't watched optimize() compaction
+  run against a live reader on Windows. It's working logically and reads are
+  MVCC-safe, but if you want this "launch-safe," I'd still add a regression test
+  that searches mid-index. Want me to write it?
+
+✻ Cogitated for 3m 11s
+
+※ recap: Goal: let MCP searches run during `ccc index`. The concurrent-read fix is done and tests pass, but the live daemon still runs old code. Next: run `ccc daemon restart` then `ccc index` to pick it up.

@@ -679,6 +679,53 @@ def status() -> None:
     print_index_stats(_client.project_status(project_root))
 
 
+def _format_bytes(num: int) -> str:
+    """Render a byte count as a human-readable size (e.g. ``1.5 GB``)."""
+    size = float(num)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+@app.command()
+@_catch_daemon_start_error
+def compact() -> None:
+    """Reclaim disk space: compact the index and prune all old versions.
+
+    LanceDB keeps superseded data files until pruned (its built-in prune only
+    reclaims versions older than 7 days), so a churny index can balloon to many
+    GB. This drops every version but the latest. The daemon holds the index lock
+    during compaction, so it waits for any in-flight indexing to finish first.
+    """
+    from rich.console import Console as _Console
+    from rich.live import Live as _Live
+    from rich.spinner import Spinner as _Spinner
+
+    from . import client as _client
+
+    project_root = str(require_project_root())
+    err_console = _Console(stderr=True)
+
+    with _Live(_Spinner("dots", "Compacting index..."), console=err_console, transient=True):
+        resp = _client.compact(project_root)
+
+    if not resp.ok:
+        _typer.echo(f"Compaction failed: {resp.message}")
+        raise _typer.Exit(code=1)
+
+    if resp.message:
+        _typer.echo(resp.message)
+        return
+
+    reclaimed = max(0, resp.bytes_before - resp.bytes_after)
+    _typer.echo("Compaction complete.")
+    _typer.echo(f"  Before:    {_format_bytes(resp.bytes_before)}")
+    _typer.echo(f"  After:     {_format_bytes(resp.bytes_after)}")
+    _typer.echo(f"  Reclaimed: {_format_bytes(reclaimed)}")
+
+
 def _try_delete_paths(paths: list[Path]) -> list[Path]:
     """Best-effort delete files/dirs. Returns the paths that are still locked."""
     import shutil as _shutil

@@ -1,0 +1,6 @@
+# Shell scripts run inside Linux containers — they MUST keep LF endings
+# regardless of the host's core.autocrlf. A CRLF shebang (`#!/bin/sh\r`) makes
+# the kernel look for an interpreter named "/bin/sh\r" and fail with
+# "required file not found".
+*.sh text eol=lf
+docker/entrypoint*.sh text eol=lf

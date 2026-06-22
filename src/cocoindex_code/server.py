@@ -12,10 +12,23 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    from .protocol import SearchResponse
+
+# Resolves a search query to a SearchResponse. The stdio server (`ccc mcp`)
+# uses a backend that round-trips through the daemon over the client socket;
+# the in-daemon HTTP server passes one that queries the project registry
+# in-process. Keyword-only args mirror the `search` tool's parameters.
+SearchBackend = Callable[..., Awaitable["SearchResponse"]]
 
 _MCP_INSTRUCTIONS = (
     "Code search and codebase understanding tools."
@@ -56,9 +69,66 @@ class SearchResultModel(BaseModel):
 # === Daemon-backed MCP server factory ===
 
 
-def create_mcp_server(project_root: str) -> FastMCP:
-    """Create a lightweight MCP server that delegates to the daemon."""
-    mcp = FastMCP("cocoindex-code", instructions=_MCP_INSTRUCTIONS)
+def _make_client_search_backend(project_root: str) -> SearchBackend:
+    """Search backend that round-trips through the daemon over the client socket.
+
+    Used by the stdio MCP server (``ccc mcp``), which runs in a separate process
+    from the daemon. The blocking client call is offloaded to a thread so the
+    asyncio event loop stays responsive.
+    """
+
+    async def backend(
+        *,
+        query: str,
+        languages: list[str] | None,
+        paths: list[str] | None,
+        limit: int,
+        offset: int,
+        refresh: bool,
+    ) -> SearchResponse:
+        from . import client as _client
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: _client.search(
+                project_root=project_root,
+                query=query,
+                languages=languages,
+                paths=paths,
+                limit=limit,
+                offset=offset,
+                refresh=refresh,
+            ),
+        )
+
+    return backend
+
+
+def create_mcp_server(
+    project_root: str,
+    search_backend: SearchBackend | None = None,
+    transport_security: TransportSecuritySettings | None = None,
+) -> FastMCP:
+    """Create an MCP server exposing the codebase ``search`` tool.
+
+    *search_backend* resolves each query to a ``SearchResponse``. It defaults to
+    a daemon-client backend (socket round-trip) for the stdio server; the daemon
+    passes a backend that queries its in-process project registry directly.
+
+    *transport_security* configures the streamable-HTTP transport's DNS-rebinding
+    protection (Host/Origin validation). When ``None``, FastMCP applies its
+    default — which, because we don't set a ``host``, auto-enables protection
+    allowing only localhost. Behind a reverse proxy (a public ``Host``), pass a
+    settings object that allows that host or disables the check; otherwise every
+    proxied request gets ``421 Invalid Host header``.
+    """
+    backend = search_backend or _make_client_search_backend(project_root)
+    mcp = FastMCP(
+        "cocoindex-code",
+        instructions=_MCP_INSTRUCTIONS,
+        transport_security=transport_security,
+    )
 
     @mcp.tool(
         name="search",
@@ -99,11 +169,13 @@ def create_mcp_server(project_root: str) -> FastMCP:
             description="Number of results to skip for pagination",
         ),
         refresh_index: bool = Field(
-            default=True,
+            default=False,
             description=(
                 "Whether to incrementally update the index before searching."
-                " Set to False for faster consecutive queries"
-                " when the codebase hasn't changed."
+                " Defaults to False: the index is expected to be refreshed out"
+                " of band (e.g. a scheduled `ccc index`), so searches read the"
+                " current table directly. Set to True to force an incremental"
+                " update before this query."
             ),
         ),
         languages: list[str] | None = Field(
@@ -118,25 +190,20 @@ def create_mcp_server(project_root: str) -> FastMCP:
             ),
         ),
     ) -> SearchResultModel:
-        """Query the codebase index via the daemon."""
-        from . import client as _client
-
-        loop = asyncio.get_event_loop()
+        """Query the codebase index via the configured backend."""
         try:
-            # The daemon refreshes the index before searching when idle; while
-            # an index pass is already running it reads the current table
-            # concurrently rather than blocking behind the index lock.
-            resp = await loop.run_in_executor(
-                None,
-                lambda: _client.search(
-                    project_root=project_root,
-                    query=query,
-                    languages=languages,
-                    paths=paths,
-                    limit=limit,
-                    offset=offset,
-                    refresh=refresh_index,
-                ),
+            # By default searches read the current table directly and do not
+            # refresh the index (the index is refreshed out of band). When
+            # refresh_index is True the daemon refreshes before searching only
+            # while idle; if an index pass is already running it reads the
+            # current table concurrently rather than blocking behind the lock.
+            resp = await backend(
+                query=query,
+                languages=languages,
+                paths=paths,
+                limit=limit,
+                offset=offset,
+                refresh=refresh_index,
             )
             return SearchResultModel(
                 success=resp.success,

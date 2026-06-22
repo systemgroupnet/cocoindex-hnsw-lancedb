@@ -11,7 +11,7 @@ from .lancedb_store import (
     score_from_distance,
 )
 from .schema import QueryResult
-from .shared import EMBEDDER, LANCE_DB, QUERY_EMBED_PARAMS
+from .shared import LANCE_DB, QUERY_EMBED_PARAMS, QUERY_EMBEDDER
 
 if TYPE_CHECKING:
     from lancedb.table import AsyncTable
@@ -100,7 +100,7 @@ async def query_codebase(
     Scores are cosine similarity (``1 - cosine_distance``), the same scale as
     the legacy sqlite-vec path.
     """
-    embedder = env.get_context(EMBEDDER)
+    embedder = env.get_context(QUERY_EMBEDDER)
     query_params = env.get_context(QUERY_EMBED_PARAMS)
 
     query_embedding = await embedder.embed(query, **query_params)

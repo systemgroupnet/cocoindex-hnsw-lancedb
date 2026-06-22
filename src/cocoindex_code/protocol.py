@@ -54,6 +54,12 @@ class DaemonEnvRequest(_msgspec.Struct, tag="daemon_env"):
     pass
 
 
+class CompactRequest(_msgspec.Struct, tag="compact"):
+    """Aggressively reclaim disk: compact files and prune all superseded versions."""
+
+    project_root: str
+
+
 Request = (
     HandshakeRequest
     | IndexRequest
@@ -64,6 +70,7 @@ Request = (
     | StopRequest
     | DoctorRequest
     | DaemonEnvRequest
+    | CompactRequest
 )
 
 # ---------------------------------------------------------------------------
@@ -180,6 +187,15 @@ class DaemonEnvResponse(_msgspec.Struct, tag="daemon_env"):
     host_path_mappings: list[DbPathMappingEntry] = []
 
 
+class CompactResponse(_msgspec.Struct, tag="compact"):
+    ok: bool
+    # On-disk size of the LanceDB store directory before/after compaction, in
+    # bytes. Lets the CLI report how much space the prune reclaimed.
+    bytes_before: int = 0
+    bytes_after: int = 0
+    message: str | None = None
+
+
 class ErrorResponse(_msgspec.Struct, tag="error"):
     message: str
     # Full formatted traceback from the daemon, when the error originates from an
@@ -199,6 +215,7 @@ Response = (
     | StopResponse
     | DoctorResponse
     | DaemonEnvResponse
+    | CompactResponse
     | ErrorResponse
 )
 

@@ -30,6 +30,7 @@ from ._version import __version__
 from .chunking import ChunkerFn as _ChunkerFn
 from .embedder_params import resolve_embedder_params
 from .protocol import (
+    CompactRequest,
     DaemonEnvRequest,
     DaemonEnvResponse,
     DaemonProjectInfo,
@@ -131,6 +132,7 @@ class ProjectRegistry:
 
     _projects: dict[str, Project]
     _embedder: Embedder | None
+    _query_embedder: Embedder | None
     _create_lock: asyncio.Lock
     indexing_params: dict[str, Any]
     query_params: dict[str, Any]
@@ -138,11 +140,16 @@ class ProjectRegistry:
     def __init__(
         self,
         embedder: Embedder | None,
+        query_embedder: Embedder | None = None,
         indexing_params: dict[str, Any] | None = None,
         query_params: dict[str, Any] | None = None,
     ) -> None:
         self._projects = {}
         self._embedder = embedder
+        # Dedicated query-side embedder so searches don't serialize behind
+        # indexing on the embedder's request lock/runner. Falls back to the
+        # indexing embedder only if a caller omits it (keeps old behavior).
+        self._query_embedder = query_embedder if query_embedder is not None else embedder
         # Serializes project creation. `Project.create` now awaits (opening the
         # async LanceDB connection) before opening the process-global
         # `coco.Environment`, so without this lock two concurrent first-time
@@ -176,9 +183,11 @@ class ProjectRegistry:
             root = Path(project_root)
             project_settings = load_project_settings(root)
             chunker_registry = _resolve_chunker_registry(project_settings.chunkers)
+            assert self._query_embedder is not None  # set whenever _embedder is
             project = await Project.create(
                 root,
                 self._embedder,
+                self._query_embedder,
                 indexing_params=self.indexing_params,
                 query_params=self.query_params,
                 chunker_registry=chunker_registry,
@@ -292,6 +301,23 @@ async def handle_connection(
             pass
 
 
+async def _run_search(project: Project, req: SearchRequest) -> SearchResponse:
+    """Execute the query against an already-prepared project."""
+    results = await project.search(
+        query=req.query,
+        languages=req.languages,
+        paths=req.paths,
+        limit=req.limit,
+        offset=req.offset,
+    )
+    return SearchResponse(
+        success=True,
+        results=results,
+        total_returned=len(results),
+        offset=req.offset,
+    )
+
+
 async def _search_with_wait(
     project: Project, req: SearchRequest
 ) -> AsyncIterator[SearchStreamResponse]:
@@ -299,21 +325,25 @@ async def _search_with_wait(
     yield IndexWaitingNotice()
     await project.wait_for_indexing_done()
     try:
-        results = await project.search(
-            query=req.query,
-            languages=req.languages,
-            paths=req.paths,
-            limit=req.limit,
-            offset=req.offset,
-        )
-        yield SearchResponse(
-            success=True,
-            results=results,
-            total_returned=len(results),
-            offset=req.offset,
-        )
+        yield await _run_search(project, req)
     except Exception as e:
         yield ErrorResponse(message=str(e))
+
+
+async def search_project(registry: ProjectRegistry, req: SearchRequest) -> SearchResponse:
+    """Resolve a search request end-to-end for the in-process MCP server.
+
+    Mirrors the ``SearchRequest`` dispatch path, but *blocks* while the first
+    index pass completes instead of streaming an ``IndexWaitingNotice`` — the
+    HTTP MCP transport has no incremental-notice channel.
+    """
+    project = await registry.get_project(req.project_root)
+    await project.ensure_indexing_started()
+    if req.refresh and not project.is_indexing:
+        await project.refresh_index()
+    if project.should_wait_for_indexing and not await project.has_indexed_rows():
+        await project.wait_for_indexing_done()
+    return await _run_search(project, req)
 
 
 async def _handle_doctor(
@@ -525,22 +555,14 @@ async def _dispatch(
             if req.refresh and not project.is_indexing:
                 await project.refresh_index()
 
-            if project.should_wait_for_indexing:
+            # Read the current table whenever it already has rows — even mid
+            # index, including during the first index pass (LanceDB commits
+            # chunks incrementally, so they're queryable before the run
+            # finishes). Only wait when there is genuinely nothing to search yet.
+            if project.should_wait_for_indexing and not await project.has_indexed_rows():
                 return _search_with_wait(project, req)
 
-            results = await project.search(
-                query=req.query,
-                languages=req.languages,
-                paths=req.paths,
-                limit=req.limit,
-                offset=req.offset,
-            )
-            return SearchResponse(
-                success=True,
-                results=results,
-                total_returned=len(results),
-                offset=req.offset,
-            )
+            return await _run_search(project, req)
 
         if isinstance(req, ProjectStatusRequest):
             project = await registry.get_project(req.project_root)
@@ -582,10 +604,177 @@ async def _dispatch(
         if isinstance(req, DoctorRequest):
             return _handle_doctor(req, registry)
 
+        if isinstance(req, CompactRequest):
+            project = await registry.get_project(req.project_root)
+            return await project.compact()
+
         return ErrorResponse(message=f"Unknown request type: {type(req).__name__}")
     except Exception as e:
         logger.exception("Error dispatching request")
         return ErrorResponse(message=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Embedded MCP HTTP server
+# ---------------------------------------------------------------------------
+
+
+def _resolve_mcp_project_root() -> str:
+    """Resolve the single project the HTTP MCP server serves.
+
+    HTTP clients carry no working directory, so the endpoint is pinned to one
+    codebase. Prefers ``COCOINDEX_CODE_ROOT_PATH``, then a project marker found
+    from the daemon's cwd, then cwd itself — so the endpoint still comes up
+    before ``ccc init`` (the search tool then returns a settings-missing error).
+    """
+    from .settings import find_project_root
+
+    env_root = os.environ.get("COCOINDEX_CODE_ROOT_PATH", "").strip()
+    if env_root:
+        return str(Path(env_root).resolve())
+    root = find_project_root(Path.cwd())
+    return str(root) if root is not None else str(Path.cwd().resolve())
+
+
+def _mcp_transport_security() -> Any:
+    """Build the streamable-HTTP transport security settings from env.
+
+    FastMCP auto-enables DNS-rebinding protection allowing only localhost
+    (because we don't set a ``host``), so behind a reverse proxy every request
+    is rejected with ``421 Invalid Host header``. These env vars let the
+    operator allow the proxied host:
+
+    * ``COCOINDEX_CODE_MCP_ALLOWED_HOSTS`` — comma-separated allowed ``Host``
+      values (e.g. ``code.example.com`` or ``code.example.com:*``). The literal
+      ``*`` disables DNS-rebinding protection entirely (use when a trusted proxy
+      already controls access).
+    * ``COCOINDEX_CODE_MCP_ALLOWED_ORIGINS`` — comma-separated allowed ``Origin``
+      values, only needed for browser-based clients.
+
+    Returns ``None`` when neither is set, preserving FastMCP's secure
+    localhost-only default for direct (non-proxied) use.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    raw_hosts = os.environ.get("COCOINDEX_CODE_MCP_ALLOWED_HOSTS", "").strip()
+    raw_origins = os.environ.get("COCOINDEX_CODE_MCP_ALLOWED_ORIGINS", "").strip()
+    if not raw_hosts and not raw_origins:
+        return None
+
+    hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
+    origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+    if "*" in hosts:
+        logger.info("MCP HTTP server: DNS-rebinding protection disabled (allowed hosts = *)")
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    logger.info("MCP HTTP server: allowed hosts=%s origins=%s", hosts, origins)
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=hosts,
+        allowed_origins=origins,
+    )
+
+
+def _start_mcp_http_server(
+    loop: asyncio.AbstractEventLoop,
+    registry: ProjectRegistry,
+    tasks: set[asyncio.Task[Any]],
+) -> None:
+    """Start the streamable-HTTP MCP server on *loop* when configured.
+
+    Enabled by ``COCOINDEX_CODE_MCP_PORT`` (host overridable via
+    ``COCOINDEX_CODE_MCP_HOST``, default 127.0.0.1), unless
+    ``COCOINDEX_CODE_MCP_DISABLE`` is set truthy — a kill switch that wins over
+    the port being set (e.g. to turn the HTTP server off for one container
+    without unsetting the image's baked-in ``COCOINDEX_CODE_MCP_PORT``). The
+    ``search`` tool queries the registry in-process, so there is no socket
+    round-trip and no external proxy. Runs as a task on the daemon's own event
+    loop so it shares the project registry; uvicorn's signal handlers are
+    disabled so the daemon keeps ownership of SIGTERM/SIGINT.
+    """
+    if os.environ.get("COCOINDEX_CODE_MCP_DISABLE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        logger.info("MCP HTTP server disabled by COCOINDEX_CODE_MCP_DISABLE")
+        return
+    port_str = os.environ.get("COCOINDEX_CODE_MCP_PORT", "").strip()
+    if not port_str:
+        return
+    try:
+        port = int(port_str)
+    except ValueError:
+        logger.error("Invalid COCOINDEX_CODE_MCP_PORT=%r; MCP server not started", port_str)
+        return
+    host = os.environ.get("COCOINDEX_CODE_MCP_HOST", "").strip() or "127.0.0.1"
+    project_root = _resolve_mcp_project_root()
+
+    import contextlib
+    from collections.abc import Iterator
+
+    import uvicorn
+
+    from .server import create_mcp_server
+
+    class _NoSignalServer(uvicorn.Server):
+        """uvicorn server that leaves SIGTERM/SIGINT to the daemon.
+
+        The daemon (on the main thread) installs its own signal handlers;
+        uvicorn would otherwise replace them and the daemon would never shut
+        down on ``docker stop``.
+        """
+
+        @contextlib.contextmanager
+        def capture_signals(self) -> Iterator[None]:
+            yield
+
+    async def _backend(
+        *,
+        query: str,
+        languages: list[str] | None,
+        paths: list[str] | None,
+        limit: int,
+        offset: int,
+        refresh: bool,
+    ) -> SearchResponse:
+        return await search_project(
+            registry,
+            SearchRequest(
+                project_root=project_root,
+                query=query,
+                languages=languages,
+                paths=paths,
+                limit=limit,
+                offset=offset,
+                refresh=refresh,
+            ),
+        )
+
+    mcp = create_mcp_server(
+        project_root,
+        search_backend=_backend,
+        transport_security=_mcp_transport_security(),
+    )
+    config = uvicorn.Config(
+        mcp.streamable_http_app(),
+        host=host,
+        port=port,
+        log_level="info",
+        access_log=False,
+    )
+    server = _NoSignalServer(config)
+
+    task = loop.create_task(server.serve())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    logger.info(
+        "MCP HTTP server listening on http://%s:%d%s (project: %s)",
+        host,
+        port,
+        mcp.settings.streamable_http_path,
+        project_root,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +798,7 @@ def run_daemon() -> None:
     # provider/model picker in `ccc init`.
     settings_mtime_us = global_settings_mtime_us()  # None when file is missing
     embedder: Embedder | None
+    query_embedder: Embedder | None = None
     indexing_params: dict[str, Any] = {}
     query_params: dict[str, Any] = {}
     handshake_warnings: list[str] = []
@@ -631,6 +821,10 @@ def run_daemon() -> None:
                 _build_backward_compat_warning(user_settings, user_settings_path())
             )
         embedder = create_embedder(user_settings.embedding, indexing_params=indexing_params)
+        # Separate instance for the query path (its own request lock / batcher) so
+        # searches don't block behind indexing. Its constructor defaults to the
+        # query params; query_codebase also spreads them per call.
+        query_embedder = create_embedder(user_settings.embedding, indexing_params=query_params)
     else:
         settings_env_keys = []
         embedder = None
@@ -653,6 +847,7 @@ def run_daemon() -> None:
     start_time = time.monotonic()
     registry = ProjectRegistry(
         embedder,
+        query_embedder=query_embedder,
         indexing_params=indexing_params,
         query_params=query_params,
     )
@@ -709,6 +904,10 @@ def run_daemon() -> None:
 
     accept_thread = threading.Thread(target=_accept_loop, daemon=True)
     accept_thread.start()
+
+    # Optionally expose an in-process streamable-HTTP MCP server on the same
+    # event loop (enabled by COCOINDEX_CODE_MCP_PORT).
+    _start_mcp_http_server(loop, registry, tasks)
 
     # --- Serve until shutdown ---
     try:

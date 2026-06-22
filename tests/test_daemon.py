@@ -355,3 +355,65 @@ def test_daemon_search_waits_for_load_time_indexing(daemon_sock: str) -> None:
     assert isinstance(resp2, SearchResponse)
     assert resp2.success is True
     conn2.close()
+
+
+# ---------------------------------------------------------------------------
+# MCP HTTP transport security (DNS-rebinding / Host header allowlist)
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_transport_security_unset_uses_sdk_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no env vars set, return None so FastMCP keeps its localhost-only default."""
+    from cocoindex_code.daemon import _mcp_transport_security
+
+    monkeypatch.delenv("COCOINDEX_CODE_MCP_ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("COCOINDEX_CODE_MCP_ALLOWED_ORIGINS", raising=False)
+    assert _mcp_transport_security() is None
+
+
+def test_mcp_transport_security_allowlist_accepts_proxied_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An allowlisted Host passes the SDK middleware; a non-listed one gets 421."""
+    import asyncio
+
+    from starlette.requests import Request
+
+    from mcp.server.transport_security import TransportSecurityMiddleware
+
+    from cocoindex_code.daemon import _mcp_transport_security
+
+    host = "code.example.com"
+    monkeypatch.setenv("COCOINDEX_CODE_MCP_ALLOWED_HOSTS", host)
+    monkeypatch.delenv("COCOINDEX_CODE_MCP_ALLOWED_ORIGINS", raising=False)
+    mw = TransportSecurityMiddleware(_mcp_transport_security())
+
+    def _req(h: str) -> Request:
+        return Request({"type": "http", "method": "GET", "headers": [(b"host", h.encode())]})
+
+    async def _check() -> None:
+        assert await mw.validate_request(_req(host)) is None  # allowed
+        bad = await mw.validate_request(_req("evil.example.com"))
+        assert bad is not None and bad.status_code == 421  # rejected
+
+    asyncio.run(_check())
+
+
+def test_mcp_transport_security_wildcard_disables_protection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`*` disables DNS-rebinding protection so any Host passes (trusted proxy)."""
+    import asyncio
+
+    from starlette.requests import Request
+
+    from mcp.server.transport_security import TransportSecurityMiddleware
+
+    from cocoindex_code.daemon import _mcp_transport_security
+
+    monkeypatch.setenv("COCOINDEX_CODE_MCP_ALLOWED_HOSTS", "*")
+    ts = _mcp_transport_security()
+    assert ts is not None and ts.enable_dns_rebinding_protection is False
+    mw = TransportSecurityMiddleware(ts)
+    req = Request({"type": "http", "method": "GET", "headers": [(b"host", b"anything.example.com")]})
+    assert asyncio.run(mw.validate_request(req)) is None

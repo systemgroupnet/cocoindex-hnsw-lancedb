@@ -117,9 +117,11 @@ async def _make_project(project_root: Path) -> Project:
         exclude_patterns=["**/.cocoindex_code"],
     )
     save_project_settings(project_root, settings)
+    embedder = _KeywordEmbedder()
     return await Project.create(
         project_root,
-        _KeywordEmbedder(),
+        embedder,
+        embedder,
         indexing_params={},
         query_params={},
     )

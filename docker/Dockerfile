@@ -31,12 +31,13 @@ RUN apt-get update \
     && groupadd -g 1000 coco \
     && useradd -u 1000 -g 1000 -m coco
 
-RUN pip install --quiet uv
+RUN --mount=type=cache,target=/root/.cache/pip pip install --quiet uv
 
 # Heavy, stable deps for full variant. Layer digest is reproducible across
 # builds (RUN command string is constant), so this layer stays cached.
 ARG CCC_VARIANT=slim
-RUN if [ "$CCC_VARIANT" = "full" ]; then \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "$CCC_VARIANT" = "full" ]; then \
         uv pip install --system sentence-transformers; \
     fi
 
@@ -61,13 +62,35 @@ WORKDIR /workspace
 
 # Runtime defaults — see the spec for what each does. All overridable at
 # `docker run -e ...` time.
+#
+# The daemon serves a streamable-HTTP MCP server in-process when
+# COCOINDEX_CODE_MCP_PORT is set (bound to 0.0.0.0 so it's reachable from
+# outside the container). No external proxy is involved — the MCP `search` tool
+# queries the daemon's project registry directly. Endpoint: http://<host>:8001/mcp
+# Set COCOINDEX_CODE_MCP_DISABLE=1 at `docker run` time to turn it off without
+# unsetting the port baked in here.
+#
+# Behind a reverse proxy (the Host header is the public hostname, not
+# localhost), the MCP SDK's DNS-rebinding protection returns `421 Invalid Host
+# header`. Allow the proxied host with COCOINDEX_CODE_MCP_ALLOWED_HOSTS, e.g.
+#   -e COCOINDEX_CODE_MCP_ALLOWED_HOSTS=code.example.com
+# (comma-separated; `host:*` matches any port). Use the literal `*` to disable
+# the Host check entirely when a trusted proxy already controls access.
+# COCOINDEX_CODE_MCP_ALLOWED_ORIGINS does the same for the Origin header
+# (only needed for browser-based clients).
 ENV COCOINDEX_CODE_DIR=/workspace/.cocoindex_code \
     COCOINDEX_CODE_RUNTIME_DIR=/var/run/cocoindex_code \
     COCOINDEX_CODE_DB_PATH_MAPPING=/workspace=/var/cocoindex/db \
-    COCOINDEX_CODE_DAEMON_SUPERVISED=1
+    COCOINDEX_CODE_DAEMON_SUPERVISED=1 \
+    COCOINDEX_CODE_MCP_HOST=0.0.0.0 \
+    COCOINDEX_CODE_MCP_PORT=8001
+
+EXPOSE 8001
 
 COPY docker/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Strip any CR before chmod: a Windows build context (core.autocrlf=true) can
+# COPY the script in with CRLF, and a `#!/bin/sh\r` shebang fails to exec.
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 
 # ─── Per-release layer (last so only this one invalidates per build) ───────
@@ -78,6 +101,7 @@ ENTRYPOINT ["/entrypoint.sh"]
 # PEP 517 build; the overlay is discarded after the RUN, so the source tree
 # doesn't persist as a layer in the final image.
 RUN --mount=type=bind,source=.,target=/ccc-src,rw=true \
+    --mount=type=cache,target=/root/.cache/uv \
     if [ "$CCC_VARIANT" = "full" ]; then \
         uv pip install --system "/ccc-src[full]"; \
     else \

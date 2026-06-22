@@ -33,6 +33,14 @@ Embedder = Union["SentenceTransformerEmbedder", "LiteLLMEmbedder"]
 
 # Context keys
 EMBEDDER = coco.ContextKey[Embedder]("embedder", detect_change=True)
+# Separate embedder instance for the query path. Kept distinct from EMBEDDER so a
+# query's embedding never serializes behind indexing: the LiteLLM embedder gates
+# every request through a per-instance lock + pacing (PacedLiteLLMEmbedder), and
+# the sentence-transformers embedder batches through a per-instance runner — a
+# shared instance makes searches block for the whole index. A second instance is
+# free for LiteLLM (no model in memory) and loads the local model twice for
+# sentence-transformers.
+QUERY_EMBEDDER = coco.ContextKey[Embedder]("query_embedder", detect_change=True)
 LANCE_DB = coco.ContextKey["LanceAsyncConnection"]("index_db")
 CODEBASE_DIR = coco.ContextKey[pathlib.Path]("codebase")
 INDEXING_EMBED_PARAMS = coco.ContextKey[dict[str, Any]]("indexing_embed_params")

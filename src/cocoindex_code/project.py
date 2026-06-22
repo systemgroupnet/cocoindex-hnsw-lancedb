@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +14,9 @@ from cocoindex.connectors import lancedb as coco_lancedb
 
 from .chunking import CHUNKER_REGISTRY, ChunkerFn
 from .indexer import indexer_main
-from .lancedb_store import TABLE_NAME, ensure_vector_index
+from .lancedb_store import TABLE_NAME, ensure_vector_index, prune_old_versions
 from .protocol import (
+    CompactResponse,
     IndexingProgress,
     IndexProgressUpdate,
     IndexResponse,
@@ -39,10 +41,24 @@ from .shared import (
     INDEXING_EMBED_PARAMS,
     LANCE_DB,
     QUERY_EMBED_PARAMS,
+    QUERY_EMBEDDER,
     Embedder,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _dir_size(path: Path) -> int:
+    """Total size in bytes of all files under *path* (0 if it doesn't exist)."""
+    total = 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            # Files can disappear mid-walk (e.g. a concurrent prune); skip them.
+            pass
+    return total
 
 
 class Project:
@@ -116,26 +132,33 @@ class Project:
                     if on_progress is not None:
                         on_progress(progress)
                     await asyncio.sleep(0.1)
-            await self._ensure_vector_index()
+            await self._finalize_index()
         finally:
             self._initial_index_done.set()
             self._indexing_stats = None
 
-    async def _ensure_vector_index(self) -> None:
-        """Build the HNSW vector index after indexing, once the table is large
-        enough to benefit. Failures are logged, not raised: an index is a query
-        optimization, and search still works via LanceDB's flat fallback.
+    async def _finalize_index(self) -> None:
+        """Post-index housekeeping: build the HNSW index and reclaim disk.
+
+        Builds the HNSW vector index once the table is large enough to benefit,
+        then prunes superseded LanceDB versions/fragments accumulated during the
+        run (LanceDB's own prune only reclaims versions >7 days old, so without
+        this the store grows without bound under churn). Failures are logged, not
+        raised: both steps are optimizations — search still works via LanceDB's
+        flat fallback, and an un-pruned table is correct, just larger.
         """
         try:
             conn = self._env.get_context(LANCE_DB)
             table = await conn.open_table(TABLE_NAME)
             if await ensure_vector_index(table):
                 logger.info("Built HNSW vector index for %s", self._project_root)
+            stats = await prune_old_versions(table)
+            logger.info("Pruned LanceDB versions for %s: %s", self._project_root, stats)
         except (FileNotFoundError, ValueError):
-            # No table yet (nothing indexed) — nothing to index.
+            # No table yet (nothing indexed) — nothing to finalize.
             pass
         except Exception:
-            logger.exception("Failed to build HNSW vector index")
+            logger.exception("Failed to finalize index (vector index / prune)")
 
     def _spawn_index(
         self,
@@ -156,6 +179,23 @@ class Project:
 
         task.add_done_callback(_clear)
         return task
+
+    async def has_indexed_rows(self) -> bool:
+        """True if the LanceDB table exists and currently holds ≥1 row.
+
+        Lets a search read partial results committed by an in-flight index —
+        including the *first* index pass — instead of waiting for the whole run
+        to finish. LanceDB commits chunks incrementally, so rows become
+        queryable as indexing progresses; only a genuinely empty/not-yet-created
+        table should make a search wait.
+        """
+        try:
+            conn = self._env.get_context(LANCE_DB)
+            table = await conn.open_table(TABLE_NAME)
+            count: int = await table.count_rows()
+            return count > 0
+        except (FileNotFoundError, ValueError):
+            return False
 
     @property
     def is_indexing(self) -> bool:
@@ -312,6 +352,45 @@ class Project:
         )
 
     # ------------------------------------------------------------------
+    # Maintenance
+    # ------------------------------------------------------------------
+
+    async def compact(self) -> CompactResponse:
+        """Aggressively reclaim disk: compact files and prune all old versions.
+
+        Holds the index lock for the duration so no index pass writes
+        concurrently — required because ``delete_unverified=True`` also removes
+        files that could belong to an in-progress write. Concurrent reads stay
+        safe (the latest version is never pruned). Reports the on-disk size of
+        the store before and after.
+        """
+        db_dir = _lancedb_dir_path(self._project_root)
+        loop = asyncio.get_event_loop()
+        before = await loop.run_in_executor(None, _dir_size, db_dir)
+        async with self._index_lock:
+            try:
+                conn = self._env.get_context(LANCE_DB)
+                table = await conn.open_table(TABLE_NAME)
+                stats = await prune_old_versions(
+                    table,
+                    cleanup_older_than=timedelta(0),
+                    delete_unverified=True,
+                )
+                logger.info("Compacted LanceDB for %s: %s", self._project_root, stats)
+            except (FileNotFoundError, ValueError):
+                return CompactResponse(
+                    ok=True,
+                    bytes_before=before,
+                    bytes_after=before,
+                    message="No index to compact yet.",
+                )
+            except Exception as e:
+                logger.exception("Compaction failed for %s", self._project_root)
+                return CompactResponse(ok=False, bytes_before=before, message=str(e))
+        after = await loop.run_in_executor(None, _dir_size, db_dir)
+        return CompactResponse(ok=True, bytes_before=before, bytes_after=after)
+
+    # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
 
@@ -331,6 +410,7 @@ class Project:
     async def create(
         project_root: Path,
         embedder: Embedder,
+        query_embedder: Embedder,
         indexing_params: dict[str, Any],
         query_params: dict[str, Any],
         chunker_registry: dict[str, ChunkerFn] | None = None,
@@ -343,7 +423,11 @@ class Project:
 
         Args:
             project_root: Root directory of the codebase to index.
-            embedder: Embedding model instance.
+            embedder: Embedding model instance used by the indexer.
+            query_embedder: Separate embedding model instance used by the query
+                path, so a search's embedding never serializes behind indexing
+                (LiteLLM gates requests through a per-instance lock; ST batches
+                through a per-instance runner). See :data:`QUERY_EMBEDDER`.
             indexing_params: Extra kwargs spread into ``embedder.embed()`` during
                 indexing (e.g. ``{"prompt_name": "passage"}``).  Pass ``{}`` for
                 no extras.
@@ -371,6 +455,7 @@ class Project:
         context.provide(CODEBASE_DIR, project_root)
         context.provide(LANCE_DB, lance_conn)
         context.provide(EMBEDDER, embedder)
+        context.provide(QUERY_EMBEDDER, query_embedder)
         context.provide(INDEXING_EMBED_PARAMS, dict(indexing_params))
         context.provide(QUERY_EMBED_PARAMS, dict(query_params))
         context.provide(CHUNKER_REGISTRY, dict(chunker_registry) if chunker_registry else {})
