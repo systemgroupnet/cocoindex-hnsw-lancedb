@@ -873,6 +873,59 @@ def _print_error(msg: str) -> None:
     _typer.echo(_click.style(f"  ERROR: {msg}", fg="red"), err=True)
 
 
+def _run_vector_type_check() -> bool:
+    """Verify the environment can build the vector column schema for CodeChunk.
+
+    Reproduces the exact type introspection the LanceDB target performs at
+    index time (``analyze_type_info`` on ``CodeChunk.embedding``). On some
+    numpy versions ``typing.get_origin(NDArray[...])`` does not resolve to
+    ``numpy.ndarray``; cocoindex then classifies the embedding field as a plain
+    (non-vector) column and indexing fails with "VectorSchemaProvider is only
+    supported for NumPy ndarray type". This runs locally (no daemon needed).
+    """
+    import sys as _sys
+
+    import numpy as _np
+
+    _print_section("Python Environment")
+    _typer.echo(f"  Python: {_sys.version.split()[0]}")
+    try:
+        import cocoindex as _coco
+
+        _typer.echo(f"  cocoindex: {getattr(_coco, '__version__', '?')}")
+    except Exception as e:  # noqa: BLE001
+        _print_error(f"Cannot import cocoindex: {e}")
+        return False
+    _typer.echo(f"  numpy: {_np.__version__}")
+
+    try:
+        from cocoindex._internal.datatype import RecordType, analyze_type_info
+
+        from .shared import CodeChunk
+
+        field = next(f for f in RecordType(CodeChunk).fields if f.name == "embedding")
+        info = analyze_type_info(field.type_hint)
+        ok = info.base_type is _np.ndarray
+    except Exception as e:  # noqa: BLE001
+        _print_error(f"Vector-type check could not run: {e}")
+        return False
+
+    _typer.echo(f"  {_ok_fail_tag(ok)} embedding column resolves to a NumPy vector")
+    if not ok:
+        _typer.echo(f"    Resolved field type: {field.type_hint!r}")
+        _typer.echo(f"    base_type: {info.base_type!r}  (expected numpy.ndarray)")
+        _print_error(
+            "This numpy version is incompatible with the installed cocoindex: "
+            "typing.get_origin(NDArray[...]) does not resolve to numpy.ndarray, "
+            "so indexing cannot build the embedding vector column."
+        )
+        _typer.echo(
+            "    Fix: align numpy to the locked version — `uv sync --frozen` "
+            '(or `pip install "numpy==2.4.2"`) — then restart the daemon.'
+        )
+    return ok
+
+
 def _print_doctor_result(result: DoctorCheckResult, *, verbose: bool = False) -> None:
     import click as _click
 
@@ -933,7 +986,10 @@ def doctor(
     except (FileNotFoundError, ValueError) as e:
         _print_error(str(e))
 
-    # --- 2. Connect to daemon (handshake with auto-start/restart) ---
+    # --- 2. Python environment (local, no daemon needed) ---
+    _run_vector_type_check()
+
+    # --- 3. Connect to daemon (handshake with auto-start/restart) ---
     _print_section("Daemon")
     daemon_ok = False
     try:
