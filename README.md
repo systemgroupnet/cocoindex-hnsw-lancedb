@@ -3,7 +3,7 @@
 </p>
 
 
-<h1 align="center">AST-based semantic code search that just works</h1>
+<h1 align="center">AST-based semantic code search that just works (with Lance, HNSW, Disk Compaction, and MCP server)</h1>
 
 ![effect](https://github.com/user-attachments/assets/cb3a4cae-0e1f-49c4-890b-7bb93317ab60)
 
@@ -183,6 +183,7 @@ The background daemon starts automatically on first use.
 | `ccc status` | Show index stats (chunk count, file count, language breakdown) |
 | `ccc mcp` | Run as MCP server in stdio mode |
 | `ccc doctor` | Run diagnostics — checks settings, daemon, model, file matching, and index health |
+| `ccc compact` | Reclaim disk — compact index files and prune all superseded versions (see [Disk usage and compaction](#disk-usage-and-compaction)) |
 | `ccc reset` | Delete index databases. `--all` also removes settings. `-f` skips confirmation. |
 | `ccc daemon status` | Show daemon version, uptime, and loaded projects |
 | `ccc daemon restart` | Restart the background daemon |
@@ -387,6 +388,7 @@ docker build -t cocoindex-code:local -f docker/Dockerfile .
 - **Ultra Performant**: ⚡ Built on top of ultra performant [Rust indexing engine](https://github.com/cocoindex-io/cocoindex). Only re-indexes changed files for fast updates.
 - **Multi-Language Support**: Python, JavaScript/TypeScript, Rust, Go, Java, C/C++, C#, SQL, Shell, and more.
 - **Embedded**: Portable and just works, no database setup required!
+- **Built for concurrency**: An embedded [LanceDB](https://lancedb.github.io/lancedb/) + HNSW vector store serves searches concurrently — even while an index pass is writing — so multiple agents (or MCP sessions) can query in parallel without blocking. See [Vector Search Backend](#vector-search-backend-lancedb--hnsw).
 - **Flexible Embeddings**: Local SentenceTransformers via the `[full]` extra (free, no API key!) or 100+ cloud providers via LiteLLM.
 
 ## Configuration
@@ -737,6 +739,25 @@ Chunk embeddings are stored in an embedded **[LanceDB](https://lancedb.github.io
 **Filtering parity and one delta.** Language filters (`--lang`) are exact matches. Path filters (`--path`) accept the same `*` / `?` GLOB wildcards as before — these are translated to LanceDB's SQL `LIKE` (`*`→`%`, `?`→`_`). The one behavioral delta from the old sqlite-vec backend: GLOB character classes (e.g. `[abc]`) are **not** supported and are treated as literal text.
 
 **Re-indexing.** Switching embedding models (different vector dimensions) requires a rebuild: `ccc reset && ccc index`. Vectors are re-exported from source — there's no in-place migration of raw vectors.
+
+### Concurrency and high-throughput reads
+
+The tool is designed for high-concurrency workloads — several coding agents, or many MCP sessions, hitting the same index at once.
+
+- **Reads never block on writes.** LanceDB is a multi-version store: a search opens a consistent snapshot and reads it independently of any writer. The daemon handles each connection as its own task, so concurrent searches run in parallel — they don't queue behind one another or behind an in-flight index pass.
+- **Searchable mid-index.** LanceDB commits chunks incrementally, so rows become queryable *while* indexing is still running — including the very first index pass. A search only waits when the table is genuinely empty; otherwise it reads whatever has been committed so far.
+- **Smart refresh.** `ccc search --refresh` (and the MCP `search` tool's `refresh_index`) only kicks off a fresh index pass when none is already in flight. If one is running, the search reads the current table concurrently instead of blocking behind the index lock.
+- **Optional HTTP MCP endpoint.** Set `COCOINDEX_CODE_MCP_PORT` to expose a streamable-HTTP MCP server from the daemon (host via `COCOINDEX_CODE_MCP_HOST`, default `127.0.0.1`; disable with `COCOINDEX_CODE_MCP_DISABLE`). It queries the same in-process registry, so many clients can share one warm daemon and embedding model.
+
+### Disk usage and compaction
+
+LanceDB is append-only: every index pass (and every refresh-on-search) writes new data files and keeps the superseded ones as historical versions. Its built-in prune only reclaims versions older than 7 days, so a high-churn index can balloon to tens of GB if left unmanaged.
+
+- **Automatic upkeep.** After each index pass the daemon compacts small fragments and prunes versions older than a short retention window (10 minutes). That window is deliberately kept — it's the safety margin that lets in-flight concurrent reads finish against a snapshot without it being deleted out from under them. This keeps the store lean during normal use with no action on your part.
+- **Manual reclaim — `ccc compact`.** For a one-time aggressive reclaim (e.g. after a big re-index), run `ccc compact`. It compacts fragments and prunes *every* version but the latest. The daemon holds the index lock for the duration, so it waits for any in-flight indexing to finish and no write races the prune. It reports bytes before/after and how much was reclaimed.
+
+  There is also a standalone [`scripts/lance_compact.py`](./scripts/lance_compact.py) that talks to the store directly (no daemon needed) — useful for inspection (`--inspect`) or reclaiming when the daemon is stopped.
+- **Recovery.** If a write is killed partway (OOM, `docker stop` mid-merge, disk full), the latest table version can reference a truncated file and become unreadable. [`scripts/lance_recover.py`](./scripts/lance_recover.py) rolls back to the most recent version that reads cleanly and prunes the corrupt files; re-run `ccc index` afterward to re-apply any dropped changes incrementally. Stop the daemon first (`ccc daemon stop`).
 
 ## Troubleshooting
 
