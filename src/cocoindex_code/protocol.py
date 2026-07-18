@@ -132,11 +132,19 @@ class SearchResponse(_msgspec.Struct, tag="search"):
     message: str | None = None
 
 
+class LanguageStats(_msgspec.Struct):
+    """Per-language breakdown in a project status response."""
+
+    chunks: int
+    loc: int
+
+
 class ProjectStatusResponse(_msgspec.Struct, tag="project_status"):
     indexing: bool
     total_chunks: int
     total_files: int
-    languages: dict[str, int]
+    total_loc: int
+    languages: dict[str, LanguageStats]
     progress: IndexingProgress | None = None
     index_exists: bool = True
 

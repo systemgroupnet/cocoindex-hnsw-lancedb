@@ -382,10 +382,11 @@ def main() -> None:
             print("\nIndex stats:")
             print(f"  Chunks: {st.total_chunks}")
             print(f"  Files:  {st.total_files}")
+            print(f"  LoC:    {st.total_loc}")
             if st.languages:
                 print("  Languages:")
-                for lang, count in sorted(st.languages.items(), key=lambda x: -x[1]):
-                    print(f"    {lang}: {count} chunks")
+                for lang, stats in sorted(st.languages.items(), key=lambda x: -x[1].loc):
+                    print(f"    {lang}: {stats.chunks} chunks, {stats.loc} LoC")
         else:
             print(f"Indexing failed: {resp.message}")
     else:

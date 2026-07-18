@@ -404,6 +404,10 @@ embeddings-local = [
 ]
 full = [
     { name = "cocoindex", extra = ["sentence-transformers"] },
+    { name = "pymysql" },
+]
+metrics = [
+    { name = "pymysql" },
 ]
 
 [package.dev-dependencies]
@@ -411,10 +415,12 @@ dev = [
     { name = "cocoindex", extra = ["sentence-transformers"] },
     { name = "mypy" },
     { name = "prek" },
+    { name = "pymysql" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
+    { name = "types-pymysql" },
     { name = "types-pyyaml" },
 ]
 
@@ -432,6 +438,8 @@ requires-dist = [
     { name = "pathspec", specifier = ">=0.12.1" },
     { name = "prek", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
+    { name = "pymysql", marker = "extra == 'full'", specifier = ">=1.1.0" },
+    { name = "pymysql", marker = "extra == 'metrics'", specifier = ">=1.1.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
@@ -440,17 +448,19 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "typer", specifier = ">=0.9.0" },
 ]
-provides-extras = ["dev", "embeddings-local", "full"]
+provides-extras = ["dev", "embeddings-local", "full", "metrics"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "cocoindex", extras = ["sentence-transformers"], specifier = ">=1.0.7,<1.1.0" },
     { name = "mypy", specifier = ">=1.0.0" },
     { name = "prek", specifier = ">=0.1.0" },
+    { name = "pymysql", specifier = ">=1.1.0" },
     { name = "pytest", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.21.0" },
     { name = "pytest-cov", specifier = ">=4.0.0" },
     { name = "ruff", specifier = ">=0.1.0" },
+    { name = "types-pymysql", specifier = ">=1.1.0" },
     { name = "types-pyyaml", specifier = ">=6.0.12.20250915" },
 ]
 
@@ -2229,6 +2239,15 @@ crypto = [
 ]
 
 [[package]]
+name = "pymysql"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c9/bc/1c6a92f385940f727daeecf3bacaf186e03875dff57197801046c583bcf0/pymysql-1.2.0.tar.gz", hash = "sha256:6c7b17ca686988104d7426c27895b455cdeea3e9d3ceb1270f0c3704fead8c33", size = 49021, upload-time = "2026-05-19T08:26:22.302Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c4/bd/2534e130295c8cfd4f0a2e31623baab7502278f1e97bcfe61db75656a77f/pymysql-1.2.0-py3-none-any.whl", hash = "sha256:62169ce6d5510f08e140c5e7990ee884a9764024e4a9a27b2cc11f1099322ae0", size = 45716, upload-time = "2026-05-19T08:26:20.974Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "9.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -3183,6 +3202,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a7/a7/e6aecc4b4eb59598829a3b5076a93aff291b4fdaa2ded25efc4e1f4d219c/typer_slim-0.24.0.tar.gz", hash = "sha256:f0ed36127183f52ae6ced2ecb2521789995992c521a46083bfcdbb652d22ad34", size = 4776, upload-time = "2026-02-16T22:08:51.2Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a7/24/5480c20380dfd18cf33d14784096dca45a24eae6102e91d49a718d3b6855/typer_slim-0.24.0-py3-none-any.whl", hash = "sha256:d5d7ee1ee2834d5020c7c616ed5e0d0f29b9a4b1dd283bdebae198ec09778d0e", size = 3394, upload-time = "2026-02-16T22:08:49.92Z" },
+]
+
+[[package]]
+name = "types-pymysql"
+version = "1.1.0.20260518"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/fb/e0/43201060de33285af04263d9bd8e8c6b007bd8e0180bd46df8fe6576842e/types_pymysql-1.1.0.20260518.tar.gz", hash = "sha256:39a2448c4267dc4551e0824d2bfaecf7dfd171e89e6dbba90f4d4d45d55e4342", size = 22427, upload-time = "2026-05-18T06:02:31.239Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b1/5a/db02b5e6633fbe49eaf4e3194bc64ec031e6436a0cfcc610cbda4f1b6a24/types_pymysql-1.1.0.20260518-py3-none-any.whl", hash = "sha256:cf697ce4e44124fc859e8e8a7f047c1dc864745c3c628b85a51b3ee01502ef98", size = 23071, upload-time = "2026-05-18T06:02:30.36Z" },
 ]
 
 [[package]]

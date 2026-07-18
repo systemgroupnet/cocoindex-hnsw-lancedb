@@ -14,6 +14,7 @@ from cocoindex.connectors import lancedb as coco_lancedb
 
 from .chunking import CHUNKER_REGISTRY, ChunkerFn
 from .indexer import indexer_main
+from . import metrics
 from .lancedb_store import TABLE_NAME, ensure_vector_index, prune_old_versions
 from .memory import MemoryGovernor, resolve_ceiling
 from .protocol import (
@@ -23,12 +24,16 @@ from .protocol import (
     IndexResponse,
     IndexStreamResponse,
     IndexWaitingNotice,
+    LanguageStats,
     ProjectStatusResponse,
     SearchResult,
 )
 from .query import open_table, query_codebase
 from .settings import (
     cocoindex_db_path as _cocoindex_db_path,
+)
+from .settings import (
+    format_path_for_display,
 )
 from .settings import (
     lancedb_dir_path as _lancedb_dir_path,
@@ -161,6 +166,27 @@ class Project:
             pass
         except Exception:
             logger.exception("Failed to finalize index (vector index / prune)")
+
+        await self._push_metrics()
+
+    async def _push_metrics(self) -> None:
+        """Push the current index stats to MySQL for DevLake (best-effort).
+
+        No-op unless a MySQL target is configured (see :mod:`.metrics`). Any
+        failure is swallowed — metrics must never break an index pass.
+        """
+        if metrics.load_config() is None:
+            return
+        try:
+            status = await self.get_status()
+        except Exception:
+            logger.exception("Failed to gather stats for metrics push")
+            return
+        repo = format_path_for_display(str(self._project_root))
+        try:
+            await metrics.push_status(repo, status)
+        except Exception:
+            logger.exception("Metrics push raised unexpectedly")
 
     def _spawn_index(
         self,
@@ -328,23 +354,51 @@ class Project:
         index_exists = True
         total_chunks = 0
         total_files = 0
-        languages: dict[str, int] = {}
+        total_loc = 0
+        languages: dict[str, LanguageStats] = {}
         try:
             conn = self._env.get_context(LANCE_DB)
             table = await conn.open_table(TABLE_NAME)
             total_chunks = await table.count_rows()
-            # Stream the (file_path, language) projection in Arrow batches rather
-            # than materializing every chunk row as a Python dict via to_list().
-            # On a large index that list was an O(rows) transient spike on every
-            # status call (and status is hit concurrently by many MCP clients).
-            # The distinct-file set is bounded by file count, not chunk count.
-            files: set[str] = set()
-            reader = await table.query().select(["file_path", "language"]).to_batches()
+            # Stream the (file_path, language, end_line) projection in Arrow
+            # batches rather than materializing every chunk row as a Python dict
+            # via to_list(). On a large index that list was an O(rows) transient
+            # spike on every status call (and status is hit concurrently by many
+            # MCP clients). Both aggregates below are bounded by file count, not
+            # chunk count.
+            #
+            # LoC = sum over files of the file's highest end_line. Chunks can
+            # overlap or leave gaps, so summing per-chunk spans would over/under-
+            # count; the per-file max is the file's line count. Per-language LoC
+            # attributes each file's line count to its language.
+            chunk_counts: dict[str, int] = {}
+            file_lang: dict[str, str] = {}
+            file_max_line: dict[str, int] = {}
+            reader = (
+                await table.query()
+                .select(["file_path", "language", "end_line"])
+                .to_batches()
+            )
             async for batch in reader:
-                files.update(batch.column("file_path").to_pylist())
-                for lang in batch.column("language").to_pylist():
-                    languages[lang] = languages.get(lang, 0) + 1
-            total_files = len(files)
+                paths = batch.column("file_path").to_pylist()
+                langs = batch.column("language").to_pylist()
+                ends = batch.column("end_line").to_pylist()
+                for path, lang, end in zip(paths, langs, ends):
+                    chunk_counts[lang] = chunk_counts.get(lang, 0) + 1
+                    file_lang[path] = lang
+                    if end > file_max_line.get(path, 0):
+                        file_max_line[path] = end
+            total_files = len(file_max_line)
+            total_loc = sum(file_max_line.values())
+
+            loc_by_lang: dict[str, int] = {}
+            for path, max_line in file_max_line.items():
+                lang = file_lang[path]
+                loc_by_lang[lang] = loc_by_lang.get(lang, 0) + max_line
+            languages = {
+                lang: LanguageStats(chunks=count, loc=loc_by_lang.get(lang, 0))
+                for lang, count in chunk_counts.items()
+            }
         except (FileNotFoundError, ValueError):
             index_exists = False
 
@@ -354,6 +408,7 @@ class Project:
             indexing=is_indexing,
             total_chunks=total_chunks,
             total_files=total_files,
+            total_loc=total_loc,
             languages=languages,
             progress=progress,
             index_exists=index_exists,

@@ -410,6 +410,7 @@ async def _handle_doctor(
             )
         )
         yield DoctorResponse(result=_check_memory(registry.governor))
+        yield DoctorResponse(result=await _check_metrics())
     else:
         # Project-scope checks
         yield DoctorResponse(result=await _check_file_walk(req.project_root))
@@ -447,6 +448,33 @@ def _check_memory(governor: MemoryGovernor) -> DoctorCheckResult:
             f"throttling. Set {ENV_MEMORY_LIMIT_MB} to enable the OOM guard."
         )
     return DoctorCheckResult(name="Memory", ok=True, details=details, errors=[])
+
+
+async def _check_metrics() -> DoctorCheckResult:
+    """Report whether DevLake metrics push is configured and reachable.
+
+    Disabled/unconfigured is reported as ``ok`` (it's opt-in). When a target is
+    configured, a short connection probe runs; an unreachable target is an
+    error so an operator notices a broken pipeline.
+    """
+    from . import metrics
+
+    config = metrics.load_config()
+    if config is None:
+        return DoctorCheckResult(
+            name="Metrics",
+            ok=True,
+            details=["Disabled (no MySQL target configured)"],
+            errors=[],
+        )
+    details = [f"Target: {metrics.describe_config(config)}"]
+    error = await asyncio.to_thread(metrics.check_connection_sync, config)
+    if error is not None:
+        return DoctorCheckResult(
+            name="Metrics", ok=False, details=details, errors=[f"Cannot connect: {error}"]
+        )
+    details.append("Connection OK")
+    return DoctorCheckResult(name="Metrics", ok=True, details=details, errors=[])
 
 
 async def _check_model(
@@ -566,22 +594,33 @@ async def _check_index_status(project_root_str: str) -> DoctorCheckResult:
             return DoctorCheckResult(name="Index Status", ok=True, details=details, errors=[])
 
         total_chunks = await table.count_rows()
-        rows = await table.query().select(["file_path", "language"]).to_list()
-        languages: dict[str, int] = {}
-        files: set[str] = set()
+        rows = await table.query().select(["file_path", "language", "end_line"]).to_list()
+        chunk_counts: dict[str, int] = {}
+        file_lang: dict[str, str] = {}
+        file_max_line: dict[str, int] = {}
         for row in rows:
-            files.add(row["file_path"])
-            languages[row["language"]] = languages.get(row["language"], 0) + 1
+            path = row["file_path"]
+            lang = row["language"]
+            chunk_counts[lang] = chunk_counts.get(lang, 0) + 1
+            file_lang[path] = lang
+            if row["end_line"] > file_max_line.get(path, 0):
+                file_max_line[path] = row["end_line"]
+        total_loc = sum(file_max_line.values())
+        loc_by_lang: dict[str, int] = {}
+        for path, max_line in file_max_line.items():
+            lang = file_lang[path]
+            loc_by_lang[lang] = loc_by_lang.get(lang, 0) + max_line
         has_hnsw = any(VECTOR_COLUMN in idx.columns for idx in await table.list_indices())
         conn.close()
 
         details.append(f"Chunks: {total_chunks}")
-        details.append(f"Files: {len(files)}")
+        details.append(f"Files: {len(file_max_line)}")
+        details.append(f"LoC: {total_loc}")
         details.append(f"Vector index: {'HNSW' if has_hnsw else 'flat (exact, small index)'}")
-        if languages:
+        if chunk_counts:
             details.append("Languages:")
-            for lang, count in sorted(languages.items(), key=lambda x: -x[1]):
-                details.append(f"  {lang}: {count} chunks")
+            for lang, count in sorted(chunk_counts.items(), key=lambda x: -loc_by_lang[x[0]]):
+                details.append(f"  {lang}: {count} chunks, {loc_by_lang[lang]} LoC")
         return DoctorCheckResult(name="Index Status", ok=True, details=details, errors=[])
     except Exception as e:
         return DoctorCheckResult(name="Index Status", ok=False, details=details, errors=[str(e)])

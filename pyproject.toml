@@ -46,7 +46,12 @@ embeddings-local = ["cocoindex[sentence-transformers]>=1.0.6,<1.1.0"]
 # `:full` image variant for consistency across install paths. Contents are
 # inlined rather than self-referencing `cocoindex-code[embeddings-local]`
 # to avoid resolver edge cases with older pip.
-full = ["cocoindex[sentence-transformers]>=1.0.6,<1.1.0"]
+full = ["cocoindex[sentence-transformers]>=1.0.6,<1.1.0", "pymysql>=1.1.0"]
+# `metrics` adds the MySQL driver used to push index stats to DevLake. Opt-in:
+# the feature stays dormant unless a MySQL target is configured via env vars.
+# (Also bundled in `full`.) Inlined rather than self-referencing another extra
+# to avoid resolver edge cases with older pip, matching the pattern above.
+metrics = ["pymysql>=1.1.0"]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -88,6 +93,8 @@ dev = [
     "mypy>=1.0.0",
     "prek>=0.1.0",
     "types-pyyaml>=6.0.12.20250915",
+    "pymysql>=1.1.0",
+    "types-pymysql>=1.1.0",
     "cocoindex[sentence-transformers]>=1.0.7,<1.1.0",
 ]
 

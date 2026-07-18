@@ -159,10 +159,11 @@ def print_index_stats(status: ProjectStatusResponse) -> None:
     _typer.echo("\nIndex stats:")
     _typer.echo(f"  Chunks: {status.total_chunks}")
     _typer.echo(f"  Files:  {status.total_files}")
+    _typer.echo(f"  LoC:    {status.total_loc}")
     if status.languages:
         _typer.echo("  Languages:")
-        for lang, count in sorted(status.languages.items(), key=lambda x: -x[1]):
-            _typer.echo(f"    {lang}: {count} chunks")
+        for lang, stats in sorted(status.languages.items(), key=lambda x: -x[1].loc):
+            _typer.echo(f"    {lang}: {stats.chunks} chunks, {stats.loc} LoC")
 
 
 def print_search_results(response: SearchResponse) -> None:

@@ -18,6 +18,7 @@ from cocoindex_code.protocol import (
     IndexRequest,
     IndexResponse,
     IndexWaitingNotice,
+    LanguageStats,
     ProjectStatusRequest,
     ProjectStatusResponse,
     RemoveProjectRequest,
@@ -250,7 +251,8 @@ def test_encode_decode_project_status_with_progress() -> None:
         indexing=True,
         total_chunks=50,
         total_files=10,
-        languages={"python": 50},
+        total_loc=1234,
+        languages={"python": LanguageStats(chunks=50, loc=1234)},
         progress=progress,
     )
     data = encode_response(resp)
@@ -266,7 +268,8 @@ def test_encode_decode_project_status_without_progress() -> None:
         indexing=False,
         total_chunks=50,
         total_files=10,
-        languages={"python": 50},
+        total_loc=1234,
+        languages={"python": LanguageStats(chunks=50, loc=1234)},
     )
     data = encode_response(resp)
     decoded = decode_response(data)
@@ -289,7 +292,9 @@ def test_all_response_types_round_trip() -> None:
         ),
         IndexWaitingNotice(),
         SearchResponse(success=True),
-        ProjectStatusResponse(indexing=False, total_chunks=0, total_files=0, languages={}),
+        ProjectStatusResponse(
+            indexing=False, total_chunks=0, total_files=0, total_loc=0, languages={}
+        ),
         DaemonStatusResponse(version="1.0.0", uptime_seconds=0.0, projects=[]),
         RemoveProjectResponse(ok=True),
         StopResponse(ok=True),

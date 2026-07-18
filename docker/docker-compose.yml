@@ -50,6 +50,18 @@ services:
       # COCOINDEX_CODE_MEMORY_LIMIT_MB: 1500
       # Optional: pin the max in-flight file count, bypassing the auto heuristic.
       # COCOINDEX_CODE_MAX_INFLIGHT_FILES: 32
+      # Optional: push index stats (chunks / files / LoC, plus a per-language
+      # breakdown) to MySQL after every index pass, for Apache DevLake
+      # dashboards. Dormant unless HOST and DATABASE are set. Run
+      # init-stat-table-script.sql against the database once to create the
+      # tables. Disable without removing config via ..._ENABLED=false.
+      # COCOINDEX_CODE_METRICS_MYSQL_HOST: mysql
+      # COCOINDEX_CODE_METRICS_MYSQL_DATABASE: lake
+      # COCOINDEX_CODE_METRICS_MYSQL_PORT: 3306
+      # COCOINDEX_CODE_METRICS_MYSQL_USER: merico
+      # COCOINDEX_CODE_METRICS_MYSQL_PASSWORD: merico
+      # COCOINDEX_CODE_METRICS_REPO: my-repo
+      # COCOINDEX_CODE_METRICS_ENABLED: "true"
 
 volumes:
   cocoindex-data:
