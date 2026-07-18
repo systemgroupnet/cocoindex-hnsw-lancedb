@@ -21,6 +21,7 @@ from .shared import (
     EMBEDDER,
     INDEXING_EMBED_PARAMS,
     LANCE_DB,
+    MEMORY_GOVERNOR,
     CodeChunk,
 )
 
@@ -139,59 +140,67 @@ async def process_file(
     file: localfs.File,
     table: lancedb.TableTarget[CodeChunk],
 ) -> None:
-    """Process a single file: chunk, embed, and store."""
+    """Process a single file: chunk, embed, and store.
+
+    The whole body runs inside ``governor.slot()`` — the memory governor's gate
+    bounds how many files are resident (text + chunks + embeddings + write
+    buffers) at once and shrinks that bound live under memory pressure, so the
+    fan-out can't outrun the container's RAM limit.
+    """
     embedder = coco.use_context(EMBEDDER)
     indexing_params = coco.use_context(INDEXING_EMBED_PARAMS)
+    governor = coco.use_context(MEMORY_GOVERNOR)
 
-    try:
-        content = await file.read_text()
-    except UnicodeDecodeError:
-        return
+    async with governor.slot():
+        try:
+            content = await file.read_text()
+        except UnicodeDecodeError:
+            return
 
-    if not content.strip():
-        return
+        if not content.strip():
+            return
 
-    suffix = file.file_path.path.suffix
-    project_root = coco.use_context(CODEBASE_DIR)
-    ps = load_project_settings(project_root)
-    ext_lang_map = {f".{lo.ext}": lo.lang for lo in ps.language_overrides}
-    language = (
-        ext_lang_map.get(suffix)
-        or detect_code_language(filename=file.file_path.path.name)
-        or "text"
-    )
-
-    chunker_registry = coco.use_context(CHUNKER_REGISTRY)
-    chunker = chunker_registry.get(suffix)
-    if chunker is not None:
-        language_override, chunks = chunker(Path(file.file_path.path), content)
-        if language_override is not None:
-            language = language_override
-    else:
-        chunks = splitter.split(
-            content,
-            chunk_size=CHUNK_SIZE,
-            min_chunk_size=MIN_CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-            language=language,
+        suffix = file.file_path.path.suffix
+        project_root = coco.use_context(CODEBASE_DIR)
+        ps = load_project_settings(project_root)
+        ext_lang_map = {f".{lo.ext}": lo.lang for lo in ps.language_overrides}
+        language = (
+            ext_lang_map.get(suffix)
+            or detect_code_language(filename=file.file_path.path.name)
+            or "text"
         )
 
-    id_gen = IdGenerator()
-
-    async def process(chunk: Chunk) -> None:
-        table.declare_row(
-            row=CodeChunk(
-                id=await id_gen.next_id(chunk.text),
-                file_path=file.file_path.path.as_posix(),
+        chunker_registry = coco.use_context(CHUNKER_REGISTRY)
+        chunker = chunker_registry.get(suffix)
+        if chunker is not None:
+            language_override, chunks = chunker(Path(file.file_path.path), content)
+            if language_override is not None:
+                language = language_override
+        else:
+            chunks = splitter.split(
+                content,
+                chunk_size=CHUNK_SIZE,
+                min_chunk_size=MIN_CHUNK_SIZE,
+                chunk_overlap=CHUNK_OVERLAP,
                 language=language,
-                content=chunk.text,
-                start_line=chunk.start.line,
-                end_line=chunk.end.line,
-                embedding=await embedder.embed(chunk.text, **indexing_params),
             )
-        )
 
-    await coco.map(process, chunks)
+        id_gen = IdGenerator()
+
+        async def process(chunk: Chunk) -> None:
+            table.declare_row(
+                row=CodeChunk(
+                    id=await id_gen.next_id(chunk.text),
+                    file_path=file.file_path.path.as_posix(),
+                    language=language,
+                    content=chunk.text,
+                    start_line=chunk.start.line,
+                    end_line=chunk.end.line,
+                    embedding=await embedder.embed(chunk.text, **indexing_params),
+                )
+            )
+
+        await coco.map(process, chunks)
 
 
 @coco.fn

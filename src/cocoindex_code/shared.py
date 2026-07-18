@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from cocoindex.ops.litellm import LiteLLMEmbedder
     from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
 
+from .memory import MemoryGovernor
 from .settings import EmbeddingSettings
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,10 @@ EMBEDDER = coco.ContextKey[Embedder]("embedder", detect_change=True)
 QUERY_EMBEDDER = coco.ContextKey[Embedder]("query_embedder", detect_change=True)
 LANCE_DB = coco.ContextKey["LanceAsyncConnection"]("index_db")
 CODEBASE_DIR = coco.ContextKey[pathlib.Path]("codebase")
+# Process-global memory governor: bounds the number of files the indexer keeps
+# in flight and throttles that gate as RAM usage approaches the container limit.
+# One instance is created in the daemon and shared across all projects.
+MEMORY_GOVERNOR = coco.ContextKey[MemoryGovernor]("memory_governor")
 INDEXING_EMBED_PARAMS = coco.ContextKey[dict[str, Any]]("indexing_embed_params")
 QUERY_EMBED_PARAMS = coco.ContextKey[dict[str, Any]]("query_embed_params")
 

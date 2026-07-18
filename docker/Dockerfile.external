@@ -77,6 +77,16 @@ ENV COCOINDEX_CODE_DIR=/workspace/.cocoindex_code \
     COCOINDEX_CODE_DB_PATH_MAPPING=/workspace=/var/cocoindex/db \
     COCOINDEX_CODE_DAEMON_SUPERVISED=1
 
+# Cap glibc's per-thread malloc arenas (default 8 × CPU cores). Fewer arenas
+# mean lower, steadier RSS under the daemon's threaded workload — avoids
+# fragmentation-driven OOM-kills in memory-capped containers.
+ENV MALLOC_ARENA_MAX=2
+
+# The daemon reads the container memory limit from the cgroup automatically and
+# sizes indexing concurrency to fit. Run with e.g. `docker run --memory 2g ...`.
+# Pin explicitly with -e COCOINDEX_CODE_MEMORY_LIMIT_MB=2048, or fix the in-flight
+# file cap with -e COCOINDEX_CODE_MAX_INFLIGHT_FILES=N.
+
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]

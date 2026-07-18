@@ -29,6 +29,15 @@ from ._daemon_paths import (
 from ._version import __version__
 from .chunking import ChunkerFn as _ChunkerFn
 from .embedder_params import resolve_embedder_params
+from .memory import (
+    ENV_MEMORY_LIMIT_MB,
+    SAFETY_MARGIN_FRACTION,
+    MemoryGovernor,
+    current_usage_bytes,
+    detect_memory_limit_bytes,
+    format_bytes,
+    resolve_ceiling,
+)
 from .protocol import (
     CompactRequest,
     DaemonEnvRequest,
@@ -115,6 +124,30 @@ def _resolve_chunker_registry(mappings: list[ChunkerMapping]) -> dict[str, _Chun
     return registry
 
 
+def _second_embedder_fits(
+    limit_bytes: int | None,
+    rss_before: int | None,
+    rss_after_first: int | None,
+) -> bool:
+    """Whether a second embedder instance fits the memory budget.
+
+    The daemon normally loads a *separate* query-side embedder so a search's
+    embedding never serializes behind indexing (see :data:`shared.QUERY_EMBEDDER`).
+    For sentence-transformers that doubles the resident model. When RAM is
+    known-tight we skip the second copy and share the indexing embedder instead,
+    trading query/index isolation for not being OOM-killed.
+
+    Returns ``True`` (keep the separate embedder — the preferred default) unless
+    we can measure that a second copy would breach the budget. For LiteLLM the
+    measured model cost is ~0, so this always returns ``True``.
+    """
+    if limit_bytes is None or rss_before is None or rss_after_first is None:
+        return True
+    model_cost = max(0, rss_after_first - rss_before)
+    projected = rss_after_first + model_cost
+    return projected <= limit_bytes * (1.0 - SAFETY_MARGIN_FRACTION)
+
+
 # ---------------------------------------------------------------------------
 # Project Registry
 # ---------------------------------------------------------------------------
@@ -136,16 +169,20 @@ class ProjectRegistry:
     _create_lock: asyncio.Lock
     indexing_params: dict[str, Any]
     query_params: dict[str, Any]
+    governor: MemoryGovernor
 
     def __init__(
         self,
         embedder: Embedder | None,
+        governor: MemoryGovernor,
         query_embedder: Embedder | None = None,
         indexing_params: dict[str, Any] | None = None,
         query_params: dict[str, Any] | None = None,
     ) -> None:
         self._projects = {}
         self._embedder = embedder
+        # Shared across every project — memory is a process-global resource.
+        self.governor = governor
         # Dedicated query-side embedder so searches don't serialize behind
         # indexing on the embedder's request lock/runner. Falls back to the
         # indexing embedder only if a caller omits it (keeps old behavior).
@@ -190,6 +227,7 @@ class ProjectRegistry:
                 self._query_embedder,
                 indexing_params=self.indexing_params,
                 query_params=self.query_params,
+                governor=self.governor,
                 chunker_registry=chunker_registry,
             )
             self._projects[project_root] = project
@@ -371,6 +409,7 @@ async def _handle_doctor(
                 registry._embedder, label="query", params=registry.query_params
             )
         )
+        yield DoctorResponse(result=_check_memory(registry.governor))
     else:
         # Project-scope checks
         yield DoctorResponse(result=await _check_file_walk(req.project_root))
@@ -381,6 +420,33 @@ async def _handle_doctor(
         result=DoctorCheckResult(name="done", ok=True, details=[], errors=[]),
         final=True,
     )
+
+
+def _check_memory(governor: MemoryGovernor) -> DoctorCheckResult:
+    """Report the detected memory limit, budget, and current usage.
+
+    Always ``ok`` — it's informational. Flags an ``undetected`` limit as a
+    detail (not an error) so an operator running an unconstrained container
+    knows the OOM guard is inactive and can set ``COCOINDEX_CODE_MEMORY_LIMIT_MB``.
+    """
+    s = governor.snapshot()
+    details = [
+        f"Memory limit: {format_bytes(s.limit_bytes)} (source: {s.source})",
+        f"Idle baseline: {format_bytes(s.baseline_bytes)}",
+        f"Current usage: {format_bytes(s.current_bytes)}",
+        f"Max in-flight files: {s.max_inflight} (current gate: {s.current_capacity})",
+    ]
+    frac = s.usage_fraction
+    if frac is not None:
+        details.append(f"Usage: {frac * 100:.0f}% of limit")
+    if s.throttle_events:
+        details.append(f"Throttle events this session: {s.throttle_events}")
+    if s.limit_bytes is None:
+        details.append(
+            f"No memory limit detected — indexing uses the default cap and no live "
+            f"throttling. Set {ENV_MEMORY_LIMIT_MB} to enable the OOM guard."
+        )
+    return DoctorCheckResult(name="Memory", ok=True, details=details, errors=[])
 
 
 async def _check_model(
@@ -796,6 +862,11 @@ def run_daemon() -> None:
     # `ccc init` writes the file, and trigger a supervisor respawn. The
     # alternative (auto-creating defaults) would skip the interactive
     # provider/model picker in `ccc init`.
+    # Learn the real memory ceiling (cgroup limit inside a container, not the
+    # host total) before loading any model, so the query-embedder decision and
+    # the indexing fan-out can both be sized to it.
+    limit_bytes, limit_source = detect_memory_limit_bytes()
+
     settings_mtime_us = global_settings_mtime_us()  # None when file is missing
     embedder: Embedder | None
     query_embedder: Embedder | None = None
@@ -820,11 +891,29 @@ def run_daemon() -> None:
             handshake_warnings.append(
                 _build_backward_compat_warning(user_settings, user_settings_path())
             )
+        rss_before_model = current_usage_bytes()
         embedder = create_embedder(user_settings.embedding, indexing_params=indexing_params)
+        rss_after_model = current_usage_bytes()
         # Separate instance for the query path (its own request lock / batcher) so
         # searches don't block behind indexing. Its constructor defaults to the
-        # query params; query_codebase also spreads them per call.
-        query_embedder = create_embedder(user_settings.embedding, indexing_params=query_params)
+        # query params; query_codebase also spreads them per call. Under a tight
+        # memory budget, loading a second sentence-transformers model would risk
+        # OOM, so we share the indexing embedder instead (and warn).
+        if _second_embedder_fits(limit_bytes, rss_before_model, rss_after_model):
+            query_embedder = create_embedder(user_settings.embedding, indexing_params=query_params)
+        else:
+            query_embedder = embedder
+            handshake_warnings.append(
+                "Low memory budget: sharing one embedding model between indexing "
+                "and search (searches may briefly block behind indexing). Raise the "
+                f"container memory limit or set {ENV_MEMORY_LIMIT_MB} to restore the "
+                "dedicated query embedder."
+            )
+            logger.warning(
+                "Sharing query embedder with indexing embedder to fit memory budget "
+                "(limit=%s)",
+                format_bytes(limit_bytes),
+            )
     else:
         settings_env_keys = []
         embedder = None
@@ -845,8 +934,17 @@ def run_daemon() -> None:
     logger.info("Daemon starting (PID %d, version %s)", os.getpid(), __version__)
 
     start_time = time.monotonic()
+
+    # Now that the embedding model(s) are resident, calibrate the governor: it
+    # records the idle footprint as its baseline and derives the static
+    # max-inflight cap from (limit - baseline). The monitor starts once the
+    # event loop is running (below).
+    governor = MemoryGovernor(limit_bytes, limit_source, resolve_ceiling())
+    governor.calibrate()
+
     registry = ProjectRegistry(
         embedder,
+        governor=governor,
         query_embedder=query_embedder,
         indexing_params=indexing_params,
         query_params=query_params,
@@ -905,6 +1003,10 @@ def run_daemon() -> None:
     accept_thread = threading.Thread(target=_accept_loop, daemon=True)
     accept_thread.start()
 
+    # Start the memory-pressure monitor on the serving loop so indexing
+    # concurrency is throttled live as RAM usage approaches the limit.
+    governor.start_monitor(loop)
+
     # Optionally expose an in-process streamable-HTTP MCP server on the same
     # event loop (enabled by COCOINDEX_CODE_MCP_PORT).
     _start_mcp_http_server(loop, registry, tasks)
@@ -915,6 +1017,7 @@ def run_daemon() -> None:
     finally:
         # 1. Stop accepting new connections.
         listener.close()
+        governor.stop_monitor()
 
         # 2. Cancel handler tasks (they may be blocked in run_in_executor).
         for task in tasks:

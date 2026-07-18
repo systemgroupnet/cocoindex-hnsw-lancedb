@@ -13,11 +13,25 @@
 # Override the image via COCOINDEX_CODE_IMAGE — for example:
 #   COCOINDEX_CODE_IMAGE=cocoindex/cocoindex-code:full docker compose up -d
 #   COCOINDEX_CODE_IMAGE=ghcr.io/cocoindex-io/cocoindex-code:latest docker compose up -d
+#
+# Memory limit: set COCOINDEX_MEM_LIMIT (e.g. 2g, 4g) to cap the container.
+# The daemon reads this cgroup limit automatically and sizes indexing
+# concurrency to fit, so it self-throttles instead of being OOM-killed —
+# no extra env var needed. Tune / inspect the budget with `ccc doctor`.
+#   COCOINDEX_MEM_LIMIT=2g docker compose up -d
 
 services:
   cocoindex-code:
     image: ${COCOINDEX_CODE_IMAGE:-cocoindex/cocoindex-code:latest}
     container_name: cocoindex-code
+    # Hard memory cap enforced by the kernel cgroup. The app detects this value
+    # and stays under it; the kernel OOM-kills only if something ignores it.
+    mem_limit: ${COCOINDEX_MEM_LIMIT:-2g}
+    # Soft target the scheduler tries to keep the container near.
+    mem_reservation: ${COCOINDEX_MEM_RESERVATION:-512m}
+    # Cap total (RAM + swap) at the RAM limit so the limit can't be silently
+    # masked by swapping — makes the budget real. Set equal to mem_limit.
+    memswap_limit: ${COCOINDEX_MEM_LIMIT:-2g}
     volumes:
       - ${COCOINDEX_HOST_WORKSPACE:-${HOME}}:/workspace
       - cocoindex-data:/var/cocoindex
@@ -30,6 +44,12 @@ services:
       # you rather than root. Not needed on macOS / Windows — leave empty.
       PUID: ${PUID:-}
       PGID: ${PGID:-}
+      # Optional: decouple the app's memory *budget* from the hard cgroup cap
+      # above (e.g. tell the app to plan for 1500 MB inside a 2g container,
+      # leaving headroom). Normally unnecessary — the cgroup limit is used.
+      # COCOINDEX_CODE_MEMORY_LIMIT_MB: 1500
+      # Optional: pin the max in-flight file count, bypassing the auto heuristic.
+      # COCOINDEX_CODE_MAX_INFLIGHT_FILES: 32
 
 volumes:
   cocoindex-data:

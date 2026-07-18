@@ -15,6 +15,7 @@ from cocoindex.connectors import lancedb as coco_lancedb
 from .chunking import CHUNKER_REGISTRY, ChunkerFn
 from .indexer import indexer_main
 from .lancedb_store import TABLE_NAME, ensure_vector_index, prune_old_versions
+from .memory import MemoryGovernor, resolve_ceiling
 from .protocol import (
     CompactResponse,
     IndexingProgress,
@@ -40,6 +41,7 @@ from .shared import (
     EMBEDDER,
     INDEXING_EMBED_PARAMS,
     LANCE_DB,
+    MEMORY_GOVERNOR,
     QUERY_EMBED_PARAMS,
     QUERY_EMBEDDER,
     Embedder,
@@ -331,11 +333,17 @@ class Project:
             conn = self._env.get_context(LANCE_DB)
             table = await conn.open_table(TABLE_NAME)
             total_chunks = await table.count_rows()
-            rows = await table.query().select(["file_path", "language"]).to_list()
+            # Stream the (file_path, language) projection in Arrow batches rather
+            # than materializing every chunk row as a Python dict via to_list().
+            # On a large index that list was an O(rows) transient spike on every
+            # status call (and status is hit concurrently by many MCP clients).
+            # The distinct-file set is bounded by file count, not chunk count.
             files: set[str] = set()
-            for row in rows:
-                files.add(row["file_path"])
-                languages[row["language"]] = languages.get(row["language"], 0) + 1
+            reader = await table.query().select(["file_path", "language"]).to_batches()
+            async for batch in reader:
+                files.update(batch.column("file_path").to_pylist())
+                for lang in batch.column("language").to_pylist():
+                    languages[lang] = languages.get(lang, 0) + 1
             total_files = len(files)
         except (FileNotFoundError, ValueError):
             index_exists = False
@@ -413,6 +421,7 @@ class Project:
         query_embedder: Embedder,
         indexing_params: dict[str, Any],
         query_params: dict[str, Any],
+        governor: MemoryGovernor | None = None,
         chunker_registry: dict[str, ChunkerFn] | None = None,
     ) -> Project:
         """Create a project with explicit embedder and per-call params.
@@ -433,10 +442,21 @@ class Project:
                 no extras.
             query_params: Extra kwargs spread into ``embedder.embed()`` for the
                 query side.
+            governor: Process-global memory governor. Its computed
+                ``max_inflight`` sizes the CocoIndex engine's fan-out to the
+                memory budget, and ``process_file`` acquires its gate so the
+                in-flight file count can be throttled live under RAM pressure.
+                Defaults to an unconstrained governor (no limit / no throttling)
+                for standalone and test use; the daemon always passes a
+                calibrated one.
             chunker_registry: Optional mapping of file suffix (e.g. ``".toml"``)
                 to a ``ChunkerFn``. When a suffix matches, the registered
                 chunker is called instead of the built-in splitter.
         """
+        if governor is None:
+            governor = MemoryGovernor(None, "undetected", resolve_ceiling())
+            governor.calibrate()
+
         settings_dir = project_root / ".cocoindex_code"
         settings_dir.mkdir(parents=True, exist_ok=True)
 
@@ -459,12 +479,18 @@ class Project:
         context.provide(INDEXING_EMBED_PARAMS, dict(indexing_params))
         context.provide(QUERY_EMBED_PARAMS, dict(query_params))
         context.provide(CHUNKER_REGISTRY, dict(chunker_registry) if chunker_registry else {})
+        context.provide(MEMORY_GOVERNOR, governor)
 
         env = coco.Environment(settings, context_provider=context)
         app = coco.App(
             coco.AppConfig(
                 name="CocoIndexCode",
                 environment=env,
+                # Cap the engine's fan-out at the memory-budget-derived value
+                # instead of the library default (1024). This is the primary
+                # guard against OOM: it bounds how many files are resident at
+                # once. The governor's live gate throttles further under pressure.
+                max_inflight_components=governor.max_inflight,
             ),
             indexer_main,
         )

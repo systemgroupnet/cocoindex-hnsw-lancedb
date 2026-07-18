@@ -377,6 +377,60 @@ Pass configuration to `docker run` / compose with `-e`:
 > to everything under it. If that's too broad, bind-mount a narrower
 > directory instead (`COCOINDEX_HOST_WORKSPACE=/path/to/code`).
 
+### Limiting memory
+
+Indexing is memory-hungry: the engine keeps many files in flight at once
+(each holding its text, chunks, and embedding vectors) and — with local
+embeddings — the model weights are resident too. In a memory-capped container
+this can trip the kernel's OOM killer.
+
+The daemon **detects the container's memory limit and sizes itself to fit**:
+it reads the cgroup limit at startup, caps how many files it indexes
+concurrently so the working set stays within budget, and throttles that
+concurrency further in real time as usage approaches the limit. So you just
+set a limit the normal Docker way — no app-specific configuration required.
+
+**Docker Compose** — set `COCOINDEX_MEM_LIMIT` (the bundled compose file wires
+it into `mem_limit` / `memswap_limit`, defaulting to `2g`):
+
+```bash
+COCOINDEX_MEM_LIMIT=4g docker compose up -d
+```
+
+**`docker run`** — use the standard `--memory` flag (match `--memory-swap` to
+it so the cap can't be masked by swap):
+
+```bash
+docker run --memory 4g --memory-swap 4g ... cocoindex/cocoindex-code:latest
+```
+
+**Verify** what the daemon detected and how it budgeted:
+
+```bash
+docker exec cocoindex-code ccc doctor   # see the "Memory" check
+```
+
+**Fine-tuning** (env vars, all optional — the cgroup limit is used by default):
+
+```bash
+# Plan for a smaller budget than the hard cap (leave headroom for sidecars),
+# or set an explicit limit when no cgroup limit is present:
+-e COCOINDEX_CODE_MEMORY_LIMIT_MB=1500
+
+# Pin the max concurrent in-flight files, bypassing the auto heuristic:
+-e COCOINDEX_CODE_MAX_INFLIGHT_FILES=32
+```
+
+The images also set `MALLOC_ARENA_MAX=2` to keep native (torch / Arrow / Lance)
+allocations from fragmenting resident memory upward over time. If you need to
+squeeze RSS further, preloading a `jemalloc`/`tcmalloc` allocator via
+`LD_PRELOAD` is the next lever.
+
+> If no memory limit is detected (e.g. an unconstrained container or a
+> non-Linux host), indexing falls back to the engine default with no runtime
+> throttling — `ccc doctor` flags this so you can set
+> `COCOINDEX_CODE_MEMORY_LIMIT_MB` to re-enable the guard.
+
 ### Build the image locally
 
 ```bash

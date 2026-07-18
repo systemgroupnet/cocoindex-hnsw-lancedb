@@ -85,6 +85,18 @@ ENV COCOINDEX_CODE_DIR=/workspace/.cocoindex_code \
     COCOINDEX_CODE_MCP_HOST=0.0.0.0 \
     COCOINDEX_CODE_MCP_PORT=8001
 
+# Cap glibc's per-thread malloc arenas. The default (8 × CPU cores) fragments
+# heap across many arenas under a threaded workload, inflating RSS and causing
+# phantom OOM-kills in memory-capped containers. 2 arenas trade a little
+# allocator contention for materially lower, steadier RSS.
+ENV MALLOC_ARENA_MAX=2
+
+# The daemon reads the container memory limit from the cgroup automatically and
+# sizes indexing concurrency to fit (so it self-limits instead of being
+# OOM-killed). Run with e.g. `docker run --memory 2g ...`. To pin the budget
+# explicitly (or when no cgroup limit is set), pass -e COCOINDEX_CODE_MEMORY_LIMIT_MB=2048.
+# Force a fixed in-flight file cap with -e COCOINDEX_CODE_MAX_INFLIGHT_FILES=N.
+
 EXPOSE 8001
 
 COPY docker/entrypoint.sh /entrypoint.sh
