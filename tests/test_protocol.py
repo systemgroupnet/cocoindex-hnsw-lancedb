@@ -21,6 +21,7 @@ from cocoindex_code.protocol import (
     LanguageStats,
     ProjectStatusRequest,
     ProjectStatusResponse,
+    PushMetricsResponse,
     RemoveProjectRequest,
     RemoveProjectResponse,
     Request,
@@ -302,6 +303,7 @@ def test_all_response_types_round_trip() -> None:
             result=DoctorCheckResult(name="test", ok=True, details=[], errors=[]),
         ),
         DaemonEnvResponse(env_names=["HOME"], settings_env_names=[]),
+        PushMetricsResponse(ok=True, pushed=True, message="pushed"),
         ErrorResponse(message="err"),
     ]
     for resp in responses:

@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 from collections.abc import AsyncIterator, Callable
+from datetime import datetime
 from multiprocessing.connection import Connection, Listener
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -26,6 +27,7 @@ from ._daemon_paths import (
     daemon_runtime_dir,
     daemon_socket_path,
 )
+from . import metrics
 from ._version import __version__
 from .chunking import ChunkerFn as _ChunkerFn
 from .embedder_params import resolve_embedder_params
@@ -56,6 +58,7 @@ from .protocol import (
     IndexStreamResponse,
     IndexWaitingNotice,
     ProjectStatusRequest,
+    PushMetricsRequest,
     RemoveProjectRequest,
     RemoveProjectResponse,
     Request,
@@ -264,6 +267,10 @@ class ProjectRegistry:
             for root, project in self._projects.items()
         ]
 
+    def active_projects(self) -> list[Project]:
+        """Snapshot of the currently-loaded projects (registered since startup)."""
+        return list(self._projects.values())
+
 
 # ---------------------------------------------------------------------------
 # Connection handler
@@ -457,8 +464,6 @@ async def _check_metrics() -> DoctorCheckResult:
     configured, a short connection probe runs; an unreachable target is an
     error so an operator notices a broken pipeline.
     """
-    from . import metrics
-
     config = metrics.load_config()
     if config is None:
         return DoctorCheckResult(
@@ -470,9 +475,7 @@ async def _check_metrics() -> DoctorCheckResult:
     details = [f"Target: {metrics.describe_config(config)}"]
     error = await asyncio.to_thread(metrics.check_connection_sync, config)
     if error is not None:
-        return DoctorCheckResult(
-            name="Metrics", ok=False, details=details, errors=[f"Cannot connect: {error}"]
-        )
+        return DoctorCheckResult(name="Metrics", ok=False, details=details, errors=[error])
     details.append("Connection OK")
     return DoctorCheckResult(name="Metrics", ok=True, details=details, errors=[])
 
@@ -713,6 +716,10 @@ async def _dispatch(
             project = await registry.get_project(req.project_root)
             return await project.compact()
 
+        if isinstance(req, PushMetricsRequest):
+            project = await registry.get_project(req.project_root)
+            return await project.push_metrics_now()
+
         return ErrorResponse(message=f"Unknown request type: {type(req).__name__}")
     except Exception as e:
         logger.exception("Error dispatching request")
@@ -883,6 +890,61 @@ def _start_mcp_http_server(
 
 
 # ---------------------------------------------------------------------------
+# Scheduled metrics push
+# ---------------------------------------------------------------------------
+
+# Upper bound on a single sleep in the daily-push scheduler. asyncio sleeps on
+# the loop's *monotonic* clock, so one ~24h sleep computed from the wall clock
+# would drift across NTP steps / DST / host suspend and miss wall-clock
+# midnight. Capping the sleep and re-checking the local date each wake tracks
+# the wall clock robustly; the loop still fires right at midnight because the
+# remaining delay shrinks below the cap as midnight approaches. Hourly wakeups
+# are negligible.
+_METRICS_POLL_CAP_SECONDS = 3600.0
+
+
+async def _push_metrics_all(registry: ProjectRegistry) -> None:
+    """Push a snapshot for every currently-loaded project (best-effort, logged)."""
+    for project in registry.active_projects():
+        try:
+            resp = await project.push_metrics_now()
+            logger.info("Scheduled metrics push: %s", resp.message)
+        except Exception:
+            logger.exception("Scheduled metrics push failed for a project")
+
+
+async def _metrics_daily_push_loop(registry: ProjectRegistry) -> None:
+    """Push a metrics snapshot for every loaded project once per local day.
+
+    The per-index push (``Project._push_metrics``) is opportunistic — it only
+    fires when indexing runs. This guarantees at least one snapshot per day so
+    DevLake dashboards have a data point even on days with no indexing. Started
+    only when a MySQL target is configured; runs until the daemon shuts down.
+
+    Wakes at most hourly (see :data:`_METRICS_POLL_CAP_SECONDS`) and pushes when
+    the local date rolls over, rather than issuing one long sleep — so it tracks
+    wall-clock midnight even if the clock is stepped or the host is suspended.
+
+    Scope is the projects loaded in the registry (those touched since the daemon
+    started), which in a typical single-repo deployment is the mounted repo once
+    it has been indexed. If no project is loaded when a new day begins, the push
+    is deferred (date not advanced) until one is — so the day's snapshot isn't
+    silently skipped.
+    """
+    last_push_date = datetime.now().date()
+    while True:
+        delay = min(metrics.seconds_until_next_midnight(datetime.now()), _METRICS_POLL_CAP_SECONDS)
+        await asyncio.sleep(delay)
+        today = datetime.now().date()
+        if today == last_push_date:
+            continue
+        if not registry.active_projects():
+            continue  # new day but nothing to push yet; retry next tick, don't advance
+        await _push_metrics_all(registry)
+        last_push_date = today
+
+
+# ---------------------------------------------------------------------------
 # Daemon main
 # ---------------------------------------------------------------------------
 
@@ -1045,6 +1107,13 @@ def run_daemon() -> None:
     # Start the memory-pressure monitor on the serving loop so indexing
     # concurrency is throttled live as RAM usage approaches the limit.
     governor.start_monitor(loop)
+
+    # Guarantee a daily metrics snapshot at local midnight, independent of
+    # indexing activity — only when a MySQL target is configured. Added to the
+    # handler-task set so shutdown cancels it cleanly.
+    if metrics.load_config() is not None:
+        tasks.add(loop.create_task(_metrics_daily_push_loop(registry)))
+        logger.info("Daily metrics push scheduled at local midnight")
 
     # Optionally expose an in-process streamable-HTTP MCP server on the same
     # event loop (enabled by COCOINDEX_CODE_MCP_PORT).

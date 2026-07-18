@@ -26,6 +26,7 @@ from .protocol import (
     IndexWaitingNotice,
     LanguageStats,
     ProjectStatusResponse,
+    PushMetricsResponse,
     SearchResult,
 )
 from .query import open_table, query_codebase
@@ -187,6 +188,50 @@ class Project:
             await metrics.push_status(repo, status)
         except Exception:
             logger.exception("Metrics push raised unexpectedly")
+
+    async def push_metrics_now(self) -> PushMetricsResponse:
+        """Push the current stats snapshot on demand (for ``ccc push-metrics``).
+
+        Unlike :meth:`_push_metrics`, this reports the outcome instead of
+        swallowing it: whether a row was written, or why not (metrics disabled,
+        no index yet, driver missing, DB unreachable).
+        """
+        config = metrics.load_config()
+        if config is None:
+            return PushMetricsResponse(
+                ok=True,
+                pushed=False,
+                message=(
+                    "Metrics is not configured. Set COCOINDEX_CODE_METRICS_MYSQL_HOST "
+                    "and COCOINDEX_CODE_METRICS_MYSQL_DATABASE (and ensure "
+                    "COCOINDEX_CODE_METRICS_ENABLED is not disabled)."
+                ),
+            )
+        status = await self.get_status()
+        if not status.index_exists:
+            return PushMetricsResponse(
+                ok=True, pushed=False, message="No index yet — nothing to push. Run `ccc index` first."
+            )
+        repo = format_path_for_display(str(self._project_root))
+        try:
+            snapshot_id = await metrics.push_snapshot(repo, status, config=config)
+        except metrics.MetricsDriverMissing as e:
+            return PushMetricsResponse(ok=False, pushed=False, message=str(e))
+        except Exception as e:
+            return PushMetricsResponse(
+                ok=False,
+                pushed=False,
+                message=f"Push to {metrics.describe_config(config)} failed: {e}",
+            )
+        return PushMetricsResponse(
+            ok=True,
+            pushed=True,
+            message=(
+                f"Pushed snapshot {snapshot_id} to {metrics.describe_config(config)} "
+                f"(chunks={status.total_chunks}, files={status.total_files}, "
+                f"loc={status.total_loc}, languages={len(status.languages)})."
+            ),
+        )
 
     def _spawn_index(
         self,

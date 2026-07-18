@@ -44,6 +44,8 @@ from .protocol import (
     IndexWaitingNotice,
     ProjectStatusRequest,
     ProjectStatusResponse,
+    PushMetricsRequest,
+    PushMetricsResponse,
     RemoveProjectRequest,
     RemoveProjectResponse,
     Request,
@@ -375,6 +377,11 @@ def compact(project_root: str) -> CompactResponse:
     lock for the duration, so no index pass writes concurrently.
     """
     return _send(CompactRequest(project_root=normalize_input_path(project_root)))  # type: ignore[return-value]
+
+
+def push_metrics(project_root: str) -> PushMetricsResponse:
+    """Push the current stats snapshot to the configured MySQL target on demand."""
+    return _send(PushMetricsRequest(project_root=normalize_input_path(project_root)))  # type: ignore[return-value]
 
 
 def doctor(

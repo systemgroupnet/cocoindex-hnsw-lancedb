@@ -108,7 +108,7 @@ RUN --mount=type=bind,source=.,target=/ccc-src,rw=true \
         if [ "$CCC_VARIANT" = "full" ]; then \
             CCC_INSTALL_SPEC="cocoindex-code[full]"; \
         else \
-            CCC_INSTALL_SPEC="cocoindex-code"; \
+            CCC_INSTALL_SPEC="cocoindex-code[metrics]"; \
         fi; \
     fi; \
     uv pip install --system "${CCC_INSTALL_SPEC}"

@@ -60,6 +60,12 @@ class CompactRequest(_msgspec.Struct, tag="compact"):
     project_root: str
 
 
+class PushMetricsRequest(_msgspec.Struct, tag="push_metrics"):
+    """Push a stats snapshot to the configured MySQL target on demand."""
+
+    project_root: str
+
+
 Request = (
     HandshakeRequest
     | IndexRequest
@@ -71,6 +77,7 @@ Request = (
     | DoctorRequest
     | DaemonEnvRequest
     | CompactRequest
+    | PushMetricsRequest
 )
 
 # ---------------------------------------------------------------------------
@@ -204,6 +211,12 @@ class CompactResponse(_msgspec.Struct, tag="compact"):
     message: str | None = None
 
 
+class PushMetricsResponse(_msgspec.Struct, tag="push_metrics"):
+    ok: bool  # False only on an actual failure (unreachable DB, missing driver)
+    pushed: bool = False  # True when a snapshot row was written
+    message: str | None = None
+
+
 class ErrorResponse(_msgspec.Struct, tag="error"):
     message: str
     # Full formatted traceback from the daemon, when the error originates from an
@@ -224,6 +237,7 @@ Response = (
     | DoctorResponse
     | DaemonEnvResponse
     | CompactResponse
+    | PushMetricsResponse
     | ErrorResponse
 )
 

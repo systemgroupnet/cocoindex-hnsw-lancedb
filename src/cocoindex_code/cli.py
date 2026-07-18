@@ -727,6 +727,27 @@ def compact() -> None:
     _typer.echo(f"  Reclaimed: {_format_bytes(reclaimed)}")
 
 
+@app.command("push-metrics")
+@_catch_daemon_start_error
+def push_metrics() -> None:
+    """Push the current index stats to the configured MySQL target (for DevLake).
+
+    Writes one timestamped snapshot (repo totals + per-language rows) immediately,
+    in addition to the automatic push after each index pass. No-op with a message
+    when metrics isn't configured or no index exists yet. Configure the target via
+    the COCOINDEX_CODE_METRICS_* environment variables; see `ccc doctor`.
+    """
+    from . import client as _client
+
+    project_root = str(require_project_root())
+    resp = _client.push_metrics(project_root)
+
+    if resp.message:
+        _typer.echo(resp.message)
+    if not resp.ok:
+        raise _typer.Exit(code=1)
+
+
 def _try_delete_paths(paths: list[Path]) -> list[Path]:
     """Best-effort delete files/dirs. Returns the paths that are still locked."""
     import shutil as _shutil

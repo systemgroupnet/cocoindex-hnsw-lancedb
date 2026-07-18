@@ -108,14 +108,15 @@ ENTRYPOINT ["/entrypoint.sh"]
 # ─── Per-release layer (last so only this one invalidates per build) ───────
 #
 # Install cocoindex-code from the bind-mounted local source tree. The extras
-# match CCC_VARIANT (slim → no extras, full → [full]). `rw=true` on the bind
-# mount gives hatch-vcs a writable overlay for `_version.py` during the
-# PEP 517 build; the overlay is discarded after the RUN, so the source tree
-# doesn't persist as a layer in the final image.
+# match CCC_VARIANT (full → [full]; slim → [metrics], which pulls only the tiny
+# pure-Python MySQL driver for the DevLake metrics push, not the embedding
+# stack). `rw=true` on the bind mount gives hatch-vcs a writable overlay for
+# `_version.py` during the PEP 517 build; the overlay is discarded after the
+# RUN, so the source tree doesn't persist as a layer in the final image.
 RUN --mount=type=bind,source=.,target=/ccc-src,rw=true \
     --mount=type=cache,target=/root/.cache/uv \
     if [ "$CCC_VARIANT" = "full" ]; then \
         uv pip install --system "/ccc-src[full]"; \
     else \
-        uv pip install --system "/ccc-src"; \
+        uv pip install --system "/ccc-src[metrics]"; \
     fi

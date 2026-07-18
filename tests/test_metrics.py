@@ -7,10 +7,13 @@ driver).
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 from typing import Any
 
 import pytest
+
+_DAY_SECONDS = 24 * 60 * 60
 
 from cocoindex_code import metrics
 from cocoindex_code.metrics import MetricsConfig
@@ -233,6 +236,36 @@ def test_push_with_no_languages_skips_language_insert() -> None:
     assert not any(e[0] == "executemany" for e in conn.log)
 
 
+def test_push_snapshot_sync_returns_id_and_writes() -> None:
+    conn = _FakeConn()
+    snapshot_id = metrics.push_snapshot_sync(
+        "/repo", _status(languages={"python": LanguageStats(chunks=1, loc=2)}),
+        config=_config(), connect=lambda _c: conn,
+    )
+    assert isinstance(snapshot_id, str) and len(snapshot_id) == 32
+    assert conn.committed is True
+    assert conn.closed is True
+    # The written rows carry this snapshot_id.
+    repo_params = next(e[2] for e in conn.log if e[0] == "execute")
+    assert repo_params[0] == snapshot_id
+
+
+def test_push_snapshot_sync_raises_on_connect_error() -> None:
+    def _fail(_c: MetricsConfig) -> Any:
+        raise ConnectionError("refused")
+
+    with pytest.raises(ConnectionError):
+        metrics.push_snapshot_sync("/repo", _status(), config=_config(), connect=_fail)
+
+
+def test_push_snapshot_sync_raises_driver_missing() -> None:
+    def _no_driver(_c: MetricsConfig) -> Any:
+        raise metrics.MetricsDriverMissing("no driver")
+
+    with pytest.raises(metrics.MetricsDriverMissing):
+        metrics.push_snapshot_sync("/repo", _status(), config=_config(), connect=_no_driver)
+
+
 def test_push_uses_repo_override() -> None:
     conn = _FakeConn()
     metrics.push_status_sync(
@@ -299,7 +332,61 @@ def test_check_connection_reports_error() -> None:
     def _fail(_c: MetricsConfig) -> Any:
         raise ConnectionError("host down")
 
-    assert metrics.check_connection_sync(_config(), connect=_fail) == "host down"
+    msg = metrics.check_connection_sync(_config(), connect=_fail)
+    assert msg is not None
+    assert "cannot connect to root@db:3306/devlake" in msg
+    assert "host down" in msg
+
+
+def test_check_connection_driver_missing_is_distinct() -> None:
+    def _no_driver(_c: MetricsConfig) -> Any:
+        raise metrics.MetricsDriverMissing(metrics._DRIVER_HINT)
+
+    msg = metrics.check_connection_sync(_config(), connect=_no_driver)
+    assert msg is not None
+    assert "PyMySQL" in msg
+    assert "cannot connect" not in msg  # not conflated with a connection failure
+
+
+def test_push_skips_when_driver_missing() -> None:
+    def _no_driver(_c: MetricsConfig) -> Any:
+        raise metrics.MetricsDriverMissing("no driver")
+
+    assert (
+        metrics.push_status_sync("/repo", _status(), config=_config(), connect=_no_driver) is False
+    )
+
+
+def test_connect_default_raises_driver_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A None entry in sys.modules makes `import pymysql` raise ImportError.
+    monkeypatch.setitem(sys.modules, "pymysql", None)
+    with pytest.raises(metrics.MetricsDriverMissing):
+        metrics._connect_default(_config())
+
+
+# --- seconds_until_next_midnight -------------------------------------------
+
+
+def test_seconds_until_next_midnight_midday() -> None:
+    # Noon → 12 hours to the next midnight.
+    now = datetime(2026, 7, 18, 12, 0, 0)
+    assert metrics.seconds_until_next_midnight(now) == 12 * 60 * 60
+
+
+def test_seconds_until_next_midnight_just_before() -> None:
+    now = datetime(2026, 7, 18, 23, 59, 59)
+    assert metrics.seconds_until_next_midnight(now) == 1.0
+
+
+def test_seconds_until_next_midnight_at_midnight_is_full_day() -> None:
+    # Exactly midnight → the *next* midnight is a full day away, never 0.
+    now = datetime(2026, 7, 18, 0, 0, 0)
+    assert metrics.seconds_until_next_midnight(now) == _DAY_SECONDS
+
+
+def test_seconds_until_next_midnight_never_below_one() -> None:
+    now = datetime(2026, 7, 18, 23, 59, 59, 999000)
+    assert metrics.seconds_until_next_midnight(now) >= 1.0
 
 
 # --- async wrapper ---------------------------------------------------------

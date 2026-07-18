@@ -37,7 +37,7 @@ import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -159,10 +159,28 @@ def resolve_repo(config: MetricsConfig, default_repo: str) -> str:
 Connect = Callable[[MetricsConfig], Any]
 
 
+class MetricsDriverMissing(RuntimeError):
+    """Raised when metrics is configured but the MySQL driver isn't installed.
+
+    Kept distinct from connection errors so callers can surface an actionable
+    "install the driver" message instead of a misleading "cannot connect".
+    """
+
+
+_DRIVER_HINT = (
+    "the MySQL driver (PyMySQL) is not installed. Install it with "
+    "`pip install 'cocoindex-code[metrics]'` (or the `[full]` extra / a `:full` "
+    "Docker image), then restart the daemon (`ccc daemon restart`)"
+)
+
+
 def _connect_default(config: MetricsConfig) -> Any:
     # PyMySQL is an optional dependency (the ``metrics`` extra); import lazily so
     # a base install that never enables metrics doesn't need it.
-    import pymysql
+    try:
+        import pymysql
+    except ImportError as e:
+        raise MetricsDriverMissing(_DRIVER_HINT) from e
 
     return pymysql.connect(
         host=config.host,
@@ -227,6 +245,53 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def seconds_until_next_midnight(now: datetime) -> float:
+    """Seconds from *now* until the next local 00:00. Always >= 1.
+
+    Used by the daemon's daily-push scheduler. Local (not UTC) so "midnight"
+    matches the operator's wall clock; the stored ``collected_at`` stays UTC.
+    """
+    next_day = (now + timedelta(days=1)).date()
+    next_midnight = datetime.combine(next_day, datetime.min.time())
+    return max(1.0, (next_midnight - now).total_seconds())
+
+
+def push_snapshot_sync(
+    default_repo: str,
+    status: ProjectStatusResponse,
+    *,
+    config: MetricsConfig,
+    connect: Connect = _connect_default,
+) -> str:
+    """Write one stats snapshot and return its ``snapshot_id``.
+
+    Raises on any failure — :class:`MetricsDriverMissing` when the driver is
+    absent, or the driver's own exception when the DB is unreachable / the write
+    fails. Used by the on-demand ``ccc push-metrics`` path, which surfaces the
+    error to the user. Callers ensure the index exists first.
+    """
+    repo = resolve_repo(config, default_repo)
+    collected_at = _utc_now()
+    conn = connect(config)
+    try:
+        snapshot_id = _write_snapshot(conn, repo, status, collected_at)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    logger.info(
+        "Pushed metrics snapshot %s for %s (chunks=%d, files=%d, loc=%d, langs=%d)",
+        snapshot_id,
+        repo,
+        status.total_chunks,
+        status.total_files,
+        status.total_loc,
+        len(status.languages),
+    )
+    return snapshot_id
+
+
 def push_status_sync(
     default_repo: str,
     status: ProjectStatusResponse,
@@ -245,39 +310,19 @@ def push_status_sync(
         return False
     if not status.index_exists:
         return False
-
-    repo = resolve_repo(cfg, default_repo)
-    collected_at = _utc_now()
     try:
-        conn = connect(cfg)
+        push_snapshot_sync(default_repo, status, config=cfg, connect=connect)
+    except MetricsDriverMissing as e:
+        logger.warning("Metrics push skipped: %s", e)
+        return False
     except Exception:
         logger.warning(
-            "Metrics push skipped: cannot connect to MySQL at %s:%d",
+            "Metrics push skipped: cannot reach MySQL at %s:%d or write failed",
             cfg.host,
             cfg.port,
             exc_info=True,
         )
         return False
-    try:
-        snapshot_id = _write_snapshot(conn, repo, status, collected_at)
-    except Exception:
-        logger.warning("Metrics push failed while writing stats for %s", repo, exc_info=True)
-        return False
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    logger.info(
-        "Pushed metrics snapshot %s for %s (chunks=%d, files=%d, loc=%d, langs=%d)",
-        snapshot_id,
-        repo,
-        status.total_chunks,
-        status.total_files,
-        status.total_loc,
-        len(status.languages),
-    )
     return True
 
 
@@ -295,16 +340,37 @@ async def push_status(
     )
 
 
+async def push_snapshot(
+    default_repo: str,
+    status: ProjectStatusResponse,
+    *,
+    config: MetricsConfig,
+    connect: Connect = _connect_default,
+) -> str:
+    """Async wrapper around :func:`push_snapshot_sync` (raising, for on-demand
+    pushes) — runs the blocking DB I/O off the event loop."""
+    return await asyncio.to_thread(
+        push_snapshot_sync, default_repo, status, config=config, connect=connect
+    )
+
+
 # --- Doctor -----------------------------------------------------------------
 
 
 def check_connection_sync(config: MetricsConfig, connect: Connect = _connect_default) -> str | None:
-    """Open and immediately close a connection. Returns an error string on
-    failure, or ``None`` when the target is reachable."""
+    """Open and immediately close a connection. Returns an actionable error
+    string on failure, or ``None`` when the target is reachable.
+
+    A missing driver and an unreachable database are distinct messages so
+    ``ccc doctor`` doesn't report "cannot connect" when the real fix is to
+    install the driver.
+    """
     try:
         conn = connect(config)
-    except Exception as e:
+    except MetricsDriverMissing as e:
         return str(e)
+    except Exception as e:
+        return f"cannot connect to {describe_config(config)}: {e}"
     try:
         conn.close()
     except Exception:
