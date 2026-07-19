@@ -25,8 +25,10 @@
 
 FROM python:3.12-slim
 
+# git: needed by the daemon's optional daily git-pull step (see
+# cocoindex_code.schedule). gosu: drop to the coco/host user in the entrypoint.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gosu \
+    && apt-get install -y --no-install-recommends gosu git \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 1000 coco \
     && useradd -u 1000 -g 1000 -m coco
@@ -83,7 +85,19 @@ ENV COCOINDEX_CODE_DIR=/workspace/.cocoindex_code \
     COCOINDEX_CODE_DB_PATH_MAPPING=/workspace=/var/cocoindex/db \
     COCOINDEX_CODE_DAEMON_SUPERVISED=1 \
     COCOINDEX_CODE_MCP_HOST=0.0.0.0 \
-    COCOINDEX_CODE_MCP_PORT=8001
+    COCOINDEX_CODE_MCP_PORT=8001 \
+    COCOINDEX_CODE_SCHEDULE_WORKSPACES=/workspace
+
+# The daemon runs a daily maintenance workflow (git pull -> index -> push
+# metrics) over COCOINDEX_CODE_SCHEDULE_WORKSPACES at COCOINDEX_CODE_SCHEDULE_TIME
+# (default 03:00 local). The git-pull step is opt-in and hard-resets the working
+# tree to its upstream, so enable it only for repos that are pure mirrors:
+#   -e COCOINDEX_CODE_GIT_PULL_ENABLED=1
+# HTTPS auth for the fetch (optional): -e COCOINDEX_CODE_GIT_USERNAME=... and
+# -e COCOINDEX_CODE_GIT_PASSWORD=<token>. Injected via an inline credential
+# helper — never written to disk or the remote URL. Omit to use host auth
+# (SSH key / token in the remote URL).
+# Disable the whole workflow with -e COCOINDEX_CODE_SCHEDULE_ENABLED=0.
 
 # Cap glibc's per-thread malloc arenas. The default (8 × CPU cores) fragments
 # heap across many arenas under a threaded workload, inflating RSS and causing

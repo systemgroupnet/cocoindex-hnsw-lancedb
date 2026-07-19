@@ -37,7 +37,7 @@ import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -243,17 +243,6 @@ def _utc_now() -> datetime:
     # Naive UTC — MySQL DATETIME has no timezone; storing UTC keeps DevLake
     # time-series consistent regardless of the daemon host's local zone.
     return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-def seconds_until_next_midnight(now: datetime) -> float:
-    """Seconds from *now* until the next local 00:00. Always >= 1.
-
-    Used by the daemon's daily-push scheduler. Local (not UTC) so "midnight"
-    matches the operator's wall clock; the stored ``collected_at`` stays UTC.
-    """
-    next_day = (now + timedelta(days=1)).date()
-    next_midnight = datetime.combine(next_day, datetime.min.time())
-    return max(1.0, (next_midnight - now).total_seconds())
 
 
 def push_snapshot_sync(

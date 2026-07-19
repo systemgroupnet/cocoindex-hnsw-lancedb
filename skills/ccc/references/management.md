@@ -61,6 +61,8 @@ ccc doctor
 
 This checks global settings, daemon status, embedding model (runs a test embedding), and — if run from within a project — file matching (walks files using the same logic as the indexer) and index status. Results stream incrementally. Always points to `daemon.log` at the end for further investigation.
 
+When the scheduled git-pull step is enabled (`COCOINDEX_CODE_GIT_PULL_ENABLED`), `ccc doctor` also runs a **"Git pull" connectivity check** — a read-only `git ls-remote` probe against the workspace's upstream — so a broken remote or bad credentials shows up before the next scheduled pull. Any credentials embedded in a remote URL are masked in the output.
+
 ### Checking Project Status
 
 To view the current project's index status:
@@ -92,6 +94,30 @@ To stop the daemon:
 ```bash
 ccc daemon stop
 ```
+
+## Scheduled Maintenance & Git Pull
+
+The daemon runs one **daily maintenance workflow** per target repo: **git pull → index → push metrics**. Each step is best-effort — a failure is logged and the next step still runs. It replaces the previously separate reindex and metrics timers with a single schedule (default 03:00 local).
+
+Pull the latest upstream changes on demand:
+
+```bash
+ccc pull
+```
+
+`ccc pull` runs the same update the workflow uses — `git fetch` then `git reset --hard` to the upstream branch. **This discards local changes to tracked files** (it's built for repos kept as mirrors); untracked/ignored files, including `.cocoindex_code/`, are never touched. Afterward run `ccc index` to reindex (or just search — searches refresh incrementally). `ccc pull` works regardless of whether the scheduled git-pull step is enabled.
+
+Configure the workflow via environment variables (read by the daemon; restart to apply changes to the schedule):
+
+| Env var | Default | Effect |
+|---|---|---|
+| `COCOINDEX_CODE_SCHEDULE_ENABLED` | on | Falsy (`0`/`false`/`no`/`off`) disables the whole workflow |
+| `COCOINDEX_CODE_SCHEDULE_TIME` | `03:00` | Local `HH:MM` (24-hour) to run |
+| `COCOINDEX_CODE_SCHEDULE_WORKSPACES` | `/workspace` in Docker | Comma-separated repo roots to process (union'd with loaded projects) |
+| `COCOINDEX_CODE_GIT_PULL_ENABLED` | **off** | Truthy enables the git-pull step (off by default — it's destructive) |
+| `COCOINDEX_CODE_GIT_USERNAME` / `COCOINDEX_CODE_GIT_PASSWORD` | — | Optional HTTPS credentials for the fetch (see below) |
+
+**Authentication.** SSH remotes use host auth (SSH key/agent). For HTTPS, set the username/password (a personal-access token as the password; username can be any non-empty value such as `x-access-token`). They're injected via an inline git credential helper scoped to the fetch — never written to disk, placed in the remote URL, or exposed in the process argv. Verify connectivity with `ccc doctor` (the "Git pull" check).
 
 ## Cleanup
 

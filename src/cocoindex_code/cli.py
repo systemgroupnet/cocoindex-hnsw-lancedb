@@ -627,6 +627,29 @@ def index() -> None:
 
 @app.command()
 @_catch_daemon_start_error
+def pull() -> None:
+    """Pull the latest changes into the workspace from its git upstream.
+
+    Runs the same update as the daily maintenance workflow: `git fetch` then
+    `git reset --hard` to the upstream branch. This discards any local changes to
+    tracked files (it's built for repos kept as mirrors). HTTPS auth uses
+    COCOINDEX_CODE_GIT_USERNAME / COCOINDEX_CODE_GIT_PASSWORD when set (see
+    `ccc doctor`); otherwise it relies on the host's git auth. Afterward, run
+    `ccc index` to reindex (or just search, which refreshes incrementally).
+    """
+    from . import client as _client
+
+    project_root = str(require_project_root())
+    print_project_header(project_root)
+    resp = _client.pull(project_root)
+    if resp.message:
+        _typer.echo(resp.message)
+    if not resp.ok:
+        raise _typer.Exit(code=1)
+
+
+@app.command()
+@_catch_daemon_start_error
 def search(
     query: list[str] = _typer.Argument(..., help="Search query"),
     lang: list[str] = _typer.Option([], "--lang", help="Filter by language"),

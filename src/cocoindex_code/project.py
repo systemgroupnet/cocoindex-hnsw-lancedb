@@ -98,12 +98,18 @@ class Project:
         self,
         on_progress: Callable[[IndexingProgress], None] | None = None,
         on_started: asyncio.Event | None = None,
+        push_metrics: bool = True,
     ) -> None:
         """Acquire the index lock, run indexing, and release.
 
         If *on_started* is provided, it is set once the lock is acquired
         (i.e. indexing has truly begun).  On completion (success or failure)
         ``_initial_index_done`` is set.
+
+        *push_metrics* controls the opportunistic post-index metrics push in
+        :meth:`_finalize_index`. The scheduled maintenance workflow passes
+        ``False`` because it pushes explicitly as its own final step (avoiding a
+        duplicate snapshot); all other callers leave it ``True``.
         """
         async with self._index_lock:
             self._indexing_stats = IndexingProgress(
@@ -116,11 +122,12 @@ class Project:
             )
             if on_started is not None:
                 on_started.set()
-            await self._run_index_inner(on_progress=on_progress)
+            await self._run_index_inner(on_progress=on_progress, push_metrics=push_metrics)
 
     async def _run_index_inner(
         self,
         on_progress: Callable[[IndexingProgress], None] | None = None,
+        push_metrics: bool = True,
     ) -> None:
         """Run indexing (lock must already be held)."""
         try:
@@ -140,12 +147,12 @@ class Project:
                     if on_progress is not None:
                         on_progress(progress)
                     await asyncio.sleep(0.1)
-            await self._finalize_index()
+            await self._finalize_index(push_metrics=push_metrics)
         finally:
             self._initial_index_done.set()
             self._indexing_stats = None
 
-    async def _finalize_index(self) -> None:
+    async def _finalize_index(self, push_metrics: bool = True) -> None:
         """Post-index housekeeping: build the HNSW index and reclaim disk.
 
         Builds the HNSW vector index once the table is large enough to benefit,
@@ -168,7 +175,8 @@ class Project:
         except Exception:
             logger.exception("Failed to finalize index (vector index / prune)")
 
-        await self._push_metrics()
+        if push_metrics:
+            await self._push_metrics()
 
     async def _push_metrics(self) -> None:
         """Push the current index stats to MySQL for DevLake (best-effort).
@@ -505,6 +513,10 @@ class Project:
     @property
     def indexing_stats(self) -> IndexingProgress | None:
         return self._indexing_stats
+
+    @property
+    def root(self) -> Path:
+        return self._project_root
 
     @property
     def env(self) -> coco.Environment:

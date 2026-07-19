@@ -66,6 +66,12 @@ class PushMetricsRequest(_msgspec.Struct, tag="push_metrics"):
     project_root: str
 
 
+class PullRequest(_msgspec.Struct, tag="pull"):
+    """Fetch and hard-reset the workspace to its git upstream on demand."""
+
+    project_root: str
+
+
 Request = (
     HandshakeRequest
     | IndexRequest
@@ -78,6 +84,7 @@ Request = (
     | DaemonEnvRequest
     | CompactRequest
     | PushMetricsRequest
+    | PullRequest
 )
 
 # ---------------------------------------------------------------------------
@@ -217,6 +224,12 @@ class PushMetricsResponse(_msgspec.Struct, tag="push_metrics"):
     message: str | None = None
 
 
+class PullResponse(_msgspec.Struct, tag="pull"):
+    ok: bool  # True only when the working tree was actually updated
+    status: str = "error"  # "updated" | "skipped" | "error"
+    message: str | None = None
+
+
 class ErrorResponse(_msgspec.Struct, tag="error"):
     message: str
     # Full formatted traceback from the daemon, when the error originates from an
@@ -238,6 +251,7 @@ Response = (
     | DaemonEnvResponse
     | CompactResponse
     | PushMetricsResponse
+    | PullResponse
     | ErrorResponse
 )
 

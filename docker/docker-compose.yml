@@ -62,6 +62,23 @@ services:
       # COCOINDEX_CODE_METRICS_MYSQL_PASSWORD: merico
       # COCOINDEX_CODE_METRICS_REPO: my-repo
       # COCOINDEX_CODE_METRICS_ENABLED: "true"
+      #
+      # Daily maintenance workflow: once per day the daemon runs
+      # git pull -> index -> push metrics for the mounted repo. Each step is
+      # best-effort — a failure is logged and the next step still runs.
+      # COCOINDEX_CODE_SCHEDULE_WORKSPACES defaults to /workspace in the image.
+      # COCOINDEX_CODE_SCHEDULE_TIME: "03:00"       # local HH:MM; default 03:00
+      # COCOINDEX_CODE_SCHEDULE_ENABLED: "true"     # set false to turn the workflow off
+      # Enable the git-pull step only for repos that are pure mirrors — it
+      # hard-resets the working tree to its upstream, discarding local changes.
+      # Off by default.
+      # COCOINDEX_CODE_GIT_PULL_ENABLED: "true"
+      # HTTPS auth for the fetch: username + password/token. Injected via an
+      # inline git credential helper — never written to disk or the remote URL.
+      # For a token, the username can be the token itself or e.g. x-access-token
+      # (GitHub). Leave unset to use host auth (SSH key / token in the remote URL).
+      # COCOINDEX_CODE_GIT_USERNAME: x-access-token
+      # COCOINDEX_CODE_GIT_PASSWORD: ghp_your_readonly_token
 
 volumes:
   cocoindex-data:

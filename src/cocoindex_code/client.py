@@ -44,6 +44,8 @@ from .protocol import (
     IndexWaitingNotice,
     ProjectStatusRequest,
     ProjectStatusResponse,
+    PullRequest,
+    PullResponse,
     PushMetricsRequest,
     PushMetricsResponse,
     RemoveProjectRequest,
@@ -382,6 +384,11 @@ def compact(project_root: str) -> CompactResponse:
 def push_metrics(project_root: str) -> PushMetricsResponse:
     """Push the current stats snapshot to the configured MySQL target on demand."""
     return _send(PushMetricsRequest(project_root=normalize_input_path(project_root)))  # type: ignore[return-value]
+
+
+def pull(project_root: str) -> PullResponse:
+    """Fetch and hard-reset the workspace to its git upstream on demand."""
+    return _send(PullRequest(project_root=normalize_input_path(project_root)))  # type: ignore[return-value]
 
 
 def doctor(

@@ -179,6 +179,7 @@ The background daemon starts automatically on first use.
 |---------|-------------|
 | `ccc init` | Initialize a project — creates settings files, adds `.cocoindex_code/` to `.gitignore` |
 | `ccc index` | Build or update the index (auto-inits if needed). Shows streaming progress. |
+| `ccc pull` | Pull latest changes from the git upstream (fetch + hard-reset). Discards local changes to tracked files; built for repos kept as mirrors. See [Scheduled maintenance & git sync](#scheduled-maintenance--git-sync). |
 | `ccc search <query>` | Semantic search across the codebase |
 | `ccc status` | Show index stats (chunk count, file count, language breakdown) |
 | `ccc mcp` | Run as MCP server in stdio mode |
@@ -430,6 +431,49 @@ squeeze RSS further, preloading a `jemalloc`/`tcmalloc` allocator via
 > non-Linux host), indexing falls back to the engine default with no runtime
 > throttling — `ccc doctor` flags this so you can set
 > `COCOINDEX_CODE_MEMORY_LIMIT_MB` to re-enable the guard.
+
+### Scheduled maintenance & git sync
+
+The daemon runs one **daily maintenance workflow** that, for each target repo, does
+three steps in order — each **best-effort**, so a failure in one is logged and the
+next still runs:
+
+1. **git pull** — fetch and hard-reset the working tree to its upstream (opt-in;
+   skipped for non-git directories),
+2. **index** — an incremental index pass over the refreshed tree,
+3. **push metrics** — write an index-stats snapshot to MySQL (only when the
+   `COCOINDEX_CODE_METRICS_*` target is configured).
+
+It replaces the old separate reindex/metrics timers with a single schedule. In the
+Docker image it targets the mounted repo (`/workspace`) at 03:00 local by default.
+Run any step on demand with `ccc pull` (step 1) and `ccc index` (step 2).
+
+| Env var | Default | Effect |
+|---|---|---|
+| `COCOINDEX_CODE_SCHEDULE_ENABLED` | on | Set falsy (`0`/`false`/`no`/`off`) to disable the whole workflow |
+| `COCOINDEX_CODE_SCHEDULE_TIME` | `03:00` | Local `HH:MM` (24-hour) to run |
+| `COCOINDEX_CODE_SCHEDULE_WORKSPACES` | `/workspace` (Docker) | Comma-separated repo roots to process (union'd with loaded projects) |
+| `COCOINDEX_CODE_GIT_PULL_ENABLED` | **off** | Set truthy to enable the git-pull step |
+| `COCOINDEX_CODE_GIT_USERNAME` | — | Optional HTTPS username (for a token, any non-empty value, e.g. `x-access-token`) |
+| `COCOINDEX_CODE_GIT_PASSWORD` | — | Optional HTTPS password / personal-access token |
+
+> **The git-pull step is destructive by design.** It runs `git fetch` then
+> `git reset --hard` to the upstream branch, discarding any local changes to
+> **tracked** files — it's built for repos kept as read-only mirrors. Untracked
+> and ignored files (including `.cocoindex_code/`) are never touched. It's **off
+> by default**; enable it only where that's what you want.
+
+**Authentication.** For SSH remotes, host auth is used (SSH key / agent). For HTTPS,
+set `COCOINDEX_CODE_GIT_USERNAME` / `COCOINDEX_CODE_GIT_PASSWORD` — they're injected
+via an inline git credential helper scoped to the fetch, so the token is **never
+written to disk, never placed in the remote URL, and never in the process argv**.
+(A container has no access to host credential helpers like the macOS Keychain, so
+supplying a token this way, or an SSH key/agent, is required.)
+
+**Diagnostics.** When git pull is enabled, `ccc doctor` runs a read-only
+`git ls-remote` **connectivity probe** ("Git pull" check) so a broken remote or bad
+credentials surfaces before the next scheduled pull. Any credentials embedded in a
+remote URL are masked in the output.
 
 ### Build the image locally
 

@@ -13,8 +13,6 @@ from typing import Any
 
 import pytest
 
-_DAY_SECONDS = 24 * 60 * 60
-
 from cocoindex_code import metrics
 from cocoindex_code.metrics import MetricsConfig
 from cocoindex_code.protocol import LanguageStats, ProjectStatusResponse
@@ -362,31 +360,6 @@ def test_connect_default_raises_driver_missing(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setitem(sys.modules, "pymysql", None)
     with pytest.raises(metrics.MetricsDriverMissing):
         metrics._connect_default(_config())
-
-
-# --- seconds_until_next_midnight -------------------------------------------
-
-
-def test_seconds_until_next_midnight_midday() -> None:
-    # Noon → 12 hours to the next midnight.
-    now = datetime(2026, 7, 18, 12, 0, 0)
-    assert metrics.seconds_until_next_midnight(now) == 12 * 60 * 60
-
-
-def test_seconds_until_next_midnight_just_before() -> None:
-    now = datetime(2026, 7, 18, 23, 59, 59)
-    assert metrics.seconds_until_next_midnight(now) == 1.0
-
-
-def test_seconds_until_next_midnight_at_midnight_is_full_day() -> None:
-    # Exactly midnight → the *next* midnight is a full day away, never 0.
-    now = datetime(2026, 7, 18, 0, 0, 0)
-    assert metrics.seconds_until_next_midnight(now) == _DAY_SECONDS
-
-
-def test_seconds_until_next_midnight_never_below_one() -> None:
-    now = datetime(2026, 7, 18, 23, 59, 59, 999000)
-    assert metrics.seconds_until_next_midnight(now) >= 1.0
 
 
 # --- async wrapper ---------------------------------------------------------

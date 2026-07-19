@@ -31,70 +31,19 @@ run_daemon() {
     fi
 }
 
-# Print `ccc daemon status` (as the coco user when PUID/PGID are set, so it can
-# reach the daemon socket). Errors are swallowed — callers grep the output.
-daemon_status_text() {
-    if [ -n "$PUID" ] && [ -n "$PGID" ]; then
-        gosu coco ccc daemon status 2>/dev/null
-    else
-        ccc daemon status 2>/dev/null
-    fi
-}
-
-run_indexer() {
-    # Skip the scheduled index when the daemon is already indexing: an explicit
-    # `ccc index` queues a second full pass behind the in-flight one (redundant
-    # work + extra write churn). `ccc daemon status` prints "[indexing]"/"[idle]"
-    # per loaded project.
-    if daemon_status_text | grep -qi '\[indexing\]'; then
-        echo "[cocoindex] Daemon already indexing — skipping scheduled index."
-        return 0
-    fi
-    if [ -n "$PUID" ] && [ -n "$PGID" ]; then
-        gosu coco ccc index
-    else
-        ccc index
-    fi
-}
-
-# Background safety net: rebuild the index once a day at 03:00. Searches already
-# refresh incrementally (the MCP/CLI search path defaults to refresh=True), so
-# this only matters when the workspace changes without anyone searching.
-indexer_loop() {
-    while true; do
-        now=$(date +%s)
-        today3am=$(date -d 'today 03:00' +%s 2>/dev/null) || today3am=0
-        tomorrow3am=$(date -d 'tomorrow 03:00' +%s 2>/dev/null) || tomorrow3am=$((now + 86400))
-        if [ "$today3am" -gt "$now" ]; then
-            next=$today3am
-        else
-            next=$tomorrow3am
-        fi
-        sleep_secs=$((next - now))
-        echo "[cocoindex] Next index run in ${sleep_secs}s (at 03:00)"
-        sleep "$sleep_secs"
-        echo "[cocoindex] Running ccc index..."
-        run_indexer || true
-    done
-}
-
 child=""
-index_child=""
 trap '
-    for pid in "$child" "$index_child"; do
-        if [ -n "$pid" ]; then
-            kill -TERM "$pid" 2>/dev/null || true
-        fi
-    done
+    if [ -n "$child" ]; then
+        kill -TERM "$child" 2>/dev/null || true
+    fi
     wait 2>/dev/null
     exit 0
 ' TERM INT
 
 # The streamable-HTTP MCP server runs inside the daemon process (enabled via
-# COCOINDEX_CODE_MCP_PORT) — no separate proxy to start here.
-indexer_loop &
-index_child=$!
-
+# COCOINDEX_CODE_MCP_PORT) — no separate proxy to start here. The daily
+# maintenance workflow (git pull -> index -> push metrics) also runs inside the
+# daemon (see cocoindex_code.schedule); there is no separate indexer loop here.
 while true; do
     start_ts=$(date +%s)
     run_daemon &
