@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path, PurePath
 
 import cocoindex as coco
@@ -13,7 +13,7 @@ from cocoindex.resources.file import FilePathMatcher, PatternFilePathMatcher
 from cocoindex.resources.id import IdGenerator
 from pathspec import GitIgnoreSpec
 
-from .chunking import CHUNKER_REGISTRY
+from .chunking import CHUNKER_REGISTRY, ChunkerFn
 from .lancedb_store import TABLE_NAME
 from .settings import load_gitignore_spec, load_project_settings
 from .shared import (
@@ -32,6 +32,48 @@ CHUNK_OVERLAP = 150
 
 # Chunking splitter (stateless, can be module-level)
 splitter = RecursiveSplitter()
+
+
+def chunk_file_content(
+    file_path: Path,
+    content: str,
+    *,
+    chunker_registry: Mapping[str, "ChunkerFn"],
+    language_overrides: Mapping[str, str],
+) -> tuple[str, list[Chunk]]:
+    """Detect language and split *content* into chunks.
+
+    Single source of truth for how a file's text becomes chunks + a language
+    label, shared by :func:`process_file` (the on-disk indexer) and the branch
+    overlay builder (which feeds git blob content). *language_overrides* maps a
+    dotted suffix (e.g. ``".vue"``) to a language, and *chunker_registry* maps a
+    dotted suffix to a custom :data:`ChunkerFn`; both come from project settings.
+
+    *file_path* is used only for its suffix/name (language detection) and is
+    handed to a custom chunker — it need not exist on disk, so a branch file read
+    from a git blob works here.
+    """
+    suffix = file_path.suffix
+    language = (
+        language_overrides.get(suffix)
+        or detect_code_language(filename=file_path.name)
+        or "text"
+    )
+
+    chunker = chunker_registry.get(suffix)
+    if chunker is not None:
+        language_override, chunks = chunker(file_path, content)
+        if language_override is not None:
+            language = language_override
+    else:
+        chunks = splitter.split(
+            content,
+            chunk_size=CHUNK_SIZE,
+            min_chunk_size=MIN_CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            language=language,
+        )
+    return language, chunks
 
 
 def _normalize_gitignore_lines(lines: Iterable[str], directory: PurePath) -> list[str]:
@@ -160,30 +202,17 @@ async def process_file(
         if not content.strip():
             return
 
-        suffix = file.file_path.path.suffix
         project_root = coco.use_context(CODEBASE_DIR)
         ps = load_project_settings(project_root)
         ext_lang_map = {f".{lo.ext}": lo.lang for lo in ps.language_overrides}
-        language = (
-            ext_lang_map.get(suffix)
-            or detect_code_language(filename=file.file_path.path.name)
-            or "text"
-        )
-
         chunker_registry = coco.use_context(CHUNKER_REGISTRY)
-        chunker = chunker_registry.get(suffix)
-        if chunker is not None:
-            language_override, chunks = chunker(Path(file.file_path.path), content)
-            if language_override is not None:
-                language = language_override
-        else:
-            chunks = splitter.split(
-                content,
-                chunk_size=CHUNK_SIZE,
-                min_chunk_size=MIN_CHUNK_SIZE,
-                chunk_overlap=CHUNK_OVERLAP,
-                language=language,
-            )
+
+        language, chunks = chunk_file_content(
+            Path(file.file_path.path),
+            content,
+            chunker_registry=chunker_registry,
+            language_overrides=ext_lang_map,
+        )
 
         id_gen = IdGenerator()
 

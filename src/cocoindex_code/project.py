@@ -12,6 +12,8 @@ from typing import Any
 import cocoindex as coco
 from cocoindex.connectors import lancedb as coco_lancedb
 
+from . import git_ops
+from .branch_overlay import BranchOverlayManager
 from .chunking import CHUNKER_REGISTRY, ChunkerFn
 from .indexer import indexer_main
 from . import metrics
@@ -73,6 +75,7 @@ class Project:
     _env: coco.Environment
     _app: coco.App[[], None]
     _project_root: Path
+    _overlays: BranchOverlayManager
     _index_lock: asyncio.Lock
     _initial_index_done: asyncio.Event
     # Set synchronously the moment an index task is created (before it acquires
@@ -374,8 +377,30 @@ class Project:
         paths: list[str] | None = None,
         limit: int = 5,
         offset: int = 0,
+        branch: str | None = None,
     ) -> list[SearchResult]:
-        """Search within this project."""
+        """Search within this project.
+
+        When *branch* is set and differs from the base ref, the search runs
+        against a branch overlay (base index minus the branch's touched files,
+        plus that ref's version of them) instead of the base index. Raises
+        ``RuntimeError`` if the base ref can't be determined or the branch can't
+        be resolved locally.
+        """
+        branch = branch.strip() if branch else None
+        if branch:
+            base_ref = git_ops.detect_base_ref(self._project_root)
+            if base_ref is None:
+                raise RuntimeError(
+                    "could not determine the base ref for branch search "
+                    "(not a git repo or detached HEAD; set COCOINDEX_CODE_BASE_REF)"
+                )
+            if branch != base_ref:
+                return await self._overlays.search(
+                    query=query, base_ref=base_ref, branch_ref=branch,
+                    languages=languages, paths=paths, limit=limit, offset=offset,
+                )
+
         table = await open_table(self._env)
         results = await query_codebase(
             query=query,
@@ -397,6 +422,10 @@ class Project:
             )
             for r in results
         ]
+
+    async def evict_stale_overlays(self) -> None:
+        """Drop branch overlays past their TTL (delegates to the overlay manager)."""
+        await self._overlays.evict_stale()
 
     # ------------------------------------------------------------------
     # Status
@@ -611,6 +640,7 @@ class Project:
         result._env = env
         result._app = app
         result._project_root = project_root
+        result._overlays = BranchOverlayManager(env, project_root)
         result._index_lock = asyncio.Lock()
         result._initial_index_done = asyncio.Event()
         result._indexing_scheduled = False

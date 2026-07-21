@@ -54,6 +54,13 @@ class CodeChunkResult(BaseModel):
     start_line: int = Field(description="Starting line number (1-indexed)")
     end_line: int = Field(description="Ending line number (1-indexed)")
     score: float = Field(description="Similarity score (0-1, higher is better)")
+    source: str = Field(
+        default="semantic",
+        description=(
+            "How this result was found: 'semantic' (vector search) or 'lexical'"
+            " (keyword scan of a high-divergence branch's changed files)."
+        ),
+    )
 
 
 class SearchResultModel(BaseModel):
@@ -85,6 +92,7 @@ def _make_client_search_backend(project_root: str) -> SearchBackend:
         limit: int,
         offset: int,
         refresh: bool,
+        branch: str | None,
     ) -> SearchResponse:
         from . import client as _client
 
@@ -99,6 +107,7 @@ def _make_client_search_backend(project_root: str) -> SearchBackend:
                 limit=limit,
                 offset=offset,
                 refresh=refresh,
+                branch=branch,
             ),
         )
 
@@ -189,6 +198,17 @@ def create_mcp_server(
                 " Example: ['src/utils/*', '*.py']"
             ),
         ),
+        branch: str | None = Field(
+            default=None,
+            description=(
+                "Git branch (or ref/SHA) to search. Omit to search the checked-out"
+                " base branch (the default). Any other ref searches that branch by"
+                " overlaying its changes on the base index: results for files it"
+                " modified reflect the branch's version. Very divergent branches"
+                " return an extra 'lexical' section (see each result's 'source')."
+                " The branch must already exist in the server's local clone."
+            ),
+        ),
     ) -> SearchResultModel:
         """Query the codebase index via the configured backend."""
         try:
@@ -204,6 +224,7 @@ def create_mcp_server(
                 limit=limit,
                 offset=offset,
                 refresh=refresh_index,
+                branch=branch,
             )
             return SearchResultModel(
                 success=resp.success,
@@ -215,6 +236,7 @@ def create_mcp_server(
                         start_line=r.start_line,
                         end_line=r.end_line,
                         score=r.score,
+                        source=r.source,
                     )
                     for r in resp.results
                 ],

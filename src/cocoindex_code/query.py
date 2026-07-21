@@ -54,12 +54,15 @@ def _glob_to_like(pattern: str) -> str:
 def _build_filter(
     languages: list[str] | None,
     paths: list[str] | None,
+    exclude_paths: list[str] | None = None,
 ) -> str | None:
     """Build a LanceDB SQL ``WHERE`` predicate from language/path filters.
 
     Languages are matched exactly (``language IN (...)``); paths are matched
-    via translated ``LIKE`` patterns OR'd together. Returns ``None`` when no
-    filter applies.
+    via translated ``LIKE`` patterns OR'd together. *exclude_paths* is the branch
+    "shadow set": exact base-index paths to drop (``file_path NOT IN (...)``) so a
+    branch search never returns the base version of a file the branch modified or
+    deleted. Returns ``None`` when no filter applies.
     """
     clauses: list[str] = []
 
@@ -72,6 +75,10 @@ def _build_filter(
             f"file_path LIKE {_sql_str_literal(_glob_to_like(p))} ESCAPE '\\'" for p in paths
         )
         clauses.append(f"({like_clauses})")
+
+    if exclude_paths:
+        not_in = ", ".join(_sql_str_literal(p) for p in exclude_paths)
+        clauses.append(f"file_path NOT IN ({not_in})")
 
     if not clauses:
         return None
@@ -86,6 +93,7 @@ async def query_codebase(
     offset: int = 0,
     languages: list[str] | None = None,
     paths: list[str] | None = None,
+    exclude_paths: list[str] | None = None,
     ef_search: int = DEFAULT_EF_SEARCH,
 ) -> list[QueryResult]:
     """Perform vector similarity search over the LanceDB ``code_chunks`` table.
@@ -108,7 +116,7 @@ async def query_codebase(
     search = await table.search(query_embedding.astype("float32"))
     search = search.distance_type(DISTANCE_TYPE).ef(ef_search)
 
-    predicate = _build_filter(languages, paths)
+    predicate = _build_filter(languages, paths, exclude_paths)
     if predicate is not None:
         search = search.where(predicate)
 

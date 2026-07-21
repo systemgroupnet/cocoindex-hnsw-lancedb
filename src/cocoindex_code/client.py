@@ -302,6 +302,7 @@ def search(
     offset: int = 0,
     refresh: bool = True,
     on_waiting: Callable[[], None] | None = None,
+    branch: str | None = None,
 ) -> SearchResponse:
     """Search the codebase.
 
@@ -327,6 +328,7 @@ def search(
                     limit=limit,
                     offset=offset,
                     refresh=refresh,
+                    branch=branch,
                 )
             )
         )

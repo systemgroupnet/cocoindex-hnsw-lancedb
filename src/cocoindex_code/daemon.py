@@ -357,6 +357,7 @@ async def _run_search(project: Project, req: SearchRequest) -> SearchResponse:
         paths=req.paths,
         limit=req.limit,
         offset=req.offset,
+        branch=req.branch,
     )
     return SearchResponse(
         success=True,
@@ -879,6 +880,7 @@ def _start_mcp_http_server(
         limit: int,
         offset: int,
         refresh: bool,
+        branch: str | None,
     ) -> SearchResponse:
         return await search_project(
             registry,
@@ -890,6 +892,7 @@ def _start_mcp_http_server(
                 limit=limit,
                 offset=offset,
                 refresh=refresh,
+                branch=branch,
             ),
         )
 
@@ -956,7 +959,7 @@ async def _scheduled_target_projects(
 async def _run_scheduled_workflow_for(
     project: Project, config: schedule.ScheduleConfig
 ) -> None:
-    """Run git pull -> index -> push metrics for one project.
+    """Run git pull -> index -> push metrics -> evict stale overlays for one project.
 
     Every step is best-effort and independently guarded: a failure is logged and
     the next step still runs, so a broken remote never blocks indexing and a
@@ -992,6 +995,12 @@ async def _run_scheduled_workflow_for(
         logger.info("Scheduled metrics push for %s: %s", root, resp.message)
     except Exception:
         logger.exception("Scheduled metrics push failed for %s", root)
+
+    # Step 4: reclaim branch overlays past their TTL (no-op when none are stale).
+    try:
+        await project.evict_stale_overlays()
+    except Exception:
+        logger.exception("Scheduled overlay eviction failed for %s", root)
 
 
 async def _run_scheduled_workflow(

@@ -1,96 +1,68 @@
-<p align="center">
-<img width="2428" alt="cocoindex code" src="https://github.com/user-attachments/assets/d05961b4-0b7b-42ea-834a-59c3c01717ca" />
-</p>
+# SG Cocoindex-Code — long-running code-search service with Lance/HNSW support
 
+A **fork of [cocoindex-io/cocoindex-code](https://github.com/cocoindex-io/cocoindex-code)** that turns it from a one-shot CLI into a **long-running service**: a background daemon that keeps the index and embedding model warm and serves AST-based semantic code search to your coding agents over **MCP** (stdio *and* HTTP) and the CLI.
 
-<h1 align="center">AST-based semantic code search that just works (with Lance, HNSW, Disk Compaction, and MCP server)</h1>
+Built on the [CocoIndex](https://github.com/cocoindex-io/cocoindex) Rust indexing engine, with an embedded [LanceDB](https://lancedb.github.io/lancedb/) + HNSW vector store.
 
-![effect](https://github.com/user-attachments/assets/cb3a4cae-0e1f-49c4-890b-7bb93317ab60)
+> This is an independent fork maintained for internal use. It is **not** distributed on PyPI and is **not** the upstream package — install it from source or build the Docker image yourself (see [Install & run](#install--run)). It is not affiliated with or endorsed by the upstream maintainers.
 
-
-A lightweight, effective **(AST-based)** semantic code search tool for your codebase. Built on [CocoIndex](https://github.com/cocoindex-io/cocoindex) — a Rust-based ultra performant data transformation engine. Use it from the CLI, or integrate with Claude, Codex, Cursor — any coding agent — via [Skill](#skill-recommended) or [MCP](#mcp-server).
-
-- Instant token saving by 70%.
-- **1 min setup** — install and go, zero config needed!
-
-<div align="center">
-
-[![Discord](https://img.shields.io/discord/1314801574169673738?logo=discord&color=5B5BD6&logoColor=white)](https://discord.com/invite/zpA9S2DR7s)
-[![GitHub](https://img.shields.io/github/stars/cocoindex-io/cocoindex?color=5B5BD6)](https://github.com/cocoindex-io/cocoindex)
-[![Documentation](https://img.shields.io/badge/Documentation-394e79?logo=readthedocs&logoColor=00B9FF)](https://cocoindex.io/docs/getting_started/quickstart)
 [![License](https://img.shields.io/badge/license-Apache%202.0-5B5BD6?logoColor=white)](https://opensource.org/licenses/Apache-2.0)
-<!--[![PyPI - Downloads](https://img.shields.io/pypi/dm/cocoindex)](https://pypistats.org/packages/cocoindex) -->
-[![PyPI Downloads](https://static.pepy.tech/badge/cocoindex/month)](https://pepy.tech/projects/cocoindex)
-[![CI](https://github.com/cocoindex-io/cocoindex/actions/workflows/CI.yml/badge.svg?event=push&color=5B5BD6)](https://github.com/cocoindex-io/cocoindex/actions/workflows/CI.yml)
-[![release](https://github.com/cocoindex-io/cocoindex/actions/workflows/release.yml/badge.svg?event=push&color=5B5BD6)](https://github.com/cocoindex-io/cocoindex/actions/workflows/release.yml)
 
+## What this fork focuses on
 
-🌟 Please help star [CocoIndex](https://github.com/cocoindex-io/cocoindex) if you like this project!
+Everything below is what this fork adds or emphasizes on top of upstream's semantic-search core:
 
-[Deutsch](https://readme-i18n.com/cocoindex-io/cocoindex-code?lang=de) |
-[English](https://readme-i18n.com/cocoindex-io/cocoindex-code?lang=en) |
-[Español](https://readme-i18n.com/cocoindex-io/cocoindex-code?lang=es) |
-[français](https://readme-i18n.com/cocoindex-io/cocoindex-code?lang=fr) |
-[日本語](https://readme-i18n.com/cocoindex-io/cocoindex-code?lang=ja) |
-[한국어](https://readme-i18n.com/cocoindex-io/cocoindex-code?lang=ko) |
-[Português](https://readme-i18n.com/cocoindex-io/cocoindex-code?lang=pt) |
-[Русский](https://readme-i18n.com/cocoindex-io/cocoindex-code?lang=ru) |
-[中文](https://readme-i18n.com/cocoindex-io/cocoindex-code?lang=zh)
+- **Long-running daemon.** A background service keeps the embedding model resident and the index open, so searches are fast and the model loads only once. Connections are handled concurrently.
+- **MCP server, stdio and HTTP.** Run `ccc mcp` for a stdio server, or expose a streamable-HTTP MCP endpoint from the daemon (`COCOINDEX_CODE_MCP_PORT`) that many clients share against one warm process.
+- **Branch search.** Search *arbitrary git branches* — not just the checked-out one — via on-the-fly diff overlays, with a lexical fallback for very divergent branches. See [Branch search](#branch-search).
+- **LanceDB + HNSW backend** with automatic disk compaction and recovery tooling. See [Vector search backend](#vector-search-backend-lancedb--hnsw).
+- **Container-aware memory governor** that sizes indexing concurrency to the cgroup limit and throttles under pressure. See [Limiting memory](#limiting-memory).
+- **Scheduled maintenance & git sync** — a daily `git pull → index → push metrics → evict overlays` workflow, built for repos kept as read-only mirrors. See [Scheduled maintenance & git sync](#scheduled-maintenance--git-sync).
+- **DevLake metrics push** — optional index-stats snapshots to MySQL.
 
-</div>
+## Install & run
 
+This fork is used two ways: **from source** (development / native install) or as a **locally built Docker image** (the primary deployment path). There is no `pipx`/`pip`/PyPI install.
 
-## Get Started — zero config, let's go!
+### From source (uv)
 
-### Install
-
-Using [pipx](https://pipx.pypa.io/stable/installation/):
-```bash
-pipx install 'cocoindex-code[full]'          # batteries included (local embeddings)
-pipx upgrade cocoindex-code                  # upgrade
-```
-
-Using [uv](https://docs.astral.sh/uv/getting-started/installation/):
-```bash
-uv tool install --upgrade 'cocoindex-code[full]'
-```
-
-Two install styles — they mirror the Docker image variants of the same names:
-- `cocoindex-code[full]` — batteries-included. Pulls in `sentence-transformers` so local embeddings (no API key required) work out of the box. The `ccc init` interactive prompt defaults to [Snowflake/snowflake-arctic-embed-xs](https://huggingface.co/Snowflake/snowflake-arctic-embed-xs).
-- `cocoindex-code` (slim) — LiteLLM-only; requires a cloud embedding provider and API key. Use when you don't want the local-embedding deps (~1 GB of torch + transformers).
-
-Next, set up your [coding agent integration](#coding-agent-integration) — or jump to [Manual CLI Usage](#manual-cli-usage) if you prefer direct control.
-
-## Coding Agent Integration
-
-### Skill (Recommended)
-
-Install the `ccc` skill so your coding agent automatically uses semantic search when needed:
+Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
-npx skills add cocoindex-io/cocoindex-code
+git clone https://mars-gitlab.systemgroup.net/aid/cocoindex-code-lance-hnsw.git
+cd cocoindex-code-lance-hnsw
+uv sync                                  # install into a local .venv
+
+uv run ccc init                          # initialize the current project (creates settings)
+uv run ccc index                         # build the index
+uv run ccc search "authentication logic" # search!
 ```
 
-That's it — no `ccc init` or `ccc index` needed. The skill teaches the agent to handle initialization, indexing, and searching on its own. It will automatically keep the index up to date as you work.
+To get `ccc` on your `PATH` (installed from this local checkout, not PyPI):
 
-The agent uses semantic search automatically when it would be helpful. You can also nudge it explicitly — just ask it to search the codebase, e.g. *"find how user sessions are managed"*, or type `/ccc` to invoke the skill directly.
-
-Works with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and other skill-compatible agents.
-
-#### Claude Code plugin marketplace
-
-For Claude Code users, this repository is also a [plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces). Install the skill from inside Claude Code with:
-
-```text
-/plugin marketplace add Roxabi/cocoindex-code
-/plugin install cocoindex-code@cocoindex-code
+```bash
+uv tool install .            # from the repo root; add '.[full]' for local embeddings
 ```
 
-This bundles the same `ccc` skill, with version pinning and `/plugin marketplace update` for updates.
+The background daemon starts automatically on first use.
 
-### MCP Server
+> **`[full]` vs slim.** `uv tool install '.[full]'` pulls in `sentence-transformers` so local embeddings (no API key) work out of the box; plain `.` is LiteLLM-only (cloud provider + API key). These mirror the Docker build variants of the same names.
 
-Alternatively, use `ccc mcp` to run as an MCP server:
+### Docker (build locally)
+
+```bash
+# slim (default) — LiteLLM cloud embeddings, ~450 MB
+docker build -t cocoindex-code:local -f docker/Dockerfile .
+
+# full — adds sentence-transformers for local embeddings, larger image
+docker build -t cocoindex-code:full --build-arg CCC_VARIANT=full -f docker/Dockerfile .
+```
+
+Then run it as a persistent container and use `docker exec` to drive it — see [Docker](#docker).
+
+## Coding agent integration (MCP)
+
+Run this fork as an MCP server so your agent uses semantic code search automatically — finding code by description, exploring unfamiliar codebases, and locating implementations without knowing exact names.
 
 <details>
 <summary>Claude Code</summary>
@@ -111,57 +83,47 @@ codex mcp add cocoindex-code -- ccc mcp
 <details>
 <summary>OpenCode</summary>
 
-```bash
-opencode mcp add
-```
-Enter MCP server name: `cocoindex-code`
-Select MCP server type: `local`
-Enter command to run: `ccc mcp`
-
-Or use opencode.json:
+`opencode.json`:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "cocoindex-code": {
       "type": "local",
-      "command": [
-        "ccc", "mcp"
-      ]
+      "command": ["ccc", "mcp"]
     }
   }
 }
 ```
 </details>
 
-Once configured, the agent automatically decides when semantic code search is helpful — finding code by description, exploring unfamiliar codebases, fuzzy/conceptual matches, or locating implementations without knowing exact names.
-
-> **Note:** The `cocoindex-code` command (without subcommand) still works as an MCP server for backward compatibility. It auto-creates settings from environment variables on first run.
+> The `cocoindex-code` command (without a subcommand) still works as a stdio MCP server for backward compatibility, auto-creating settings from environment variables on first run.
 
 <details>
-<summary>MCP Tool Reference</summary>
+<summary>MCP tool reference</summary>
 
-When running as an MCP server (`ccc mcp`), the following tool is exposed:
+When running as an MCP server (`ccc mcp`, or the HTTP endpoint), one tool is exposed:
 
-**`search`** — Search the codebase using semantic similarity.
+**`search`** — semantic code search across the codebase.
 
 ```
 search(
     query: str,                          # Natural language query or code snippet
     limit: int = 5,                      # Maximum results (1-100)
     offset: int = 0,                     # Pagination offset
-    refresh_index: bool = True,          # Refresh index before querying
+    refresh_index: bool = False,         # Incrementally update the index before searching
     languages: list[str] | None = None,  # Filter by language (e.g. ["python", "typescript"])
     paths: list[str] | None = None,      # Filter by path glob (e.g. ["src/utils/*"])
+    branch: str | None = None,           # Git branch/ref to search (default: the base branch)
 )
 ```
 
-Returns matching code chunks with file path, language, code content, line numbers, and similarity score.
+Returns matching code chunks with file path, language, code content, line numbers, a similarity `score`, and a `source` field (`"semantic"` or `"lexical"` — see [Branch search](#branch-search)).
+
+`refresh_index` defaults to **False**: the index is expected to be refreshed out of band (e.g. the scheduled `ccc index`), so searches read the current table directly. Set it True to force an incremental update before the query.
 </details>
 
-## Manual CLI Usage
-
-You can also use the CLI directly — useful for manual control, running indexing after changing settings, checking status, or searching outside an agent.
+## Manual CLI usage
 
 ```bash
 ccc init                                # initialize project (creates settings)
@@ -169,18 +131,16 @@ ccc index                               # build the index
 ccc search "authentication logic"       # search!
 ```
 
-The background daemon starts automatically on first use.
+> **Tip:** `ccc index` auto-initializes if you haven't run `ccc init` yet, so you can skip straight to indexing. (From a source checkout, prefix commands with `uv run`.)
 
-> **Tip:** `ccc index` auto-initializes if you haven't run `ccc init` yet, so you can skip straight to indexing.
-
-### CLI Reference
+### CLI reference
 
 | Command | Description |
 |---------|-------------|
 | `ccc init` | Initialize a project — creates settings files, adds `.cocoindex_code/` to `.gitignore` |
 | `ccc index` | Build or update the index (auto-inits if needed). Shows streaming progress. |
 | `ccc pull` | Pull latest changes from the git upstream (fetch + hard-reset). Discards local changes to tracked files; built for repos kept as mirrors. See [Scheduled maintenance & git sync](#scheduled-maintenance--git-sync). |
-| `ccc search <query>` | Semantic search across the codebase |
+| `ccc search <query>` | Semantic search across the codebase (see [Search options](#search-options)) |
 | `ccc status` | Show index stats (chunk count, file count, language breakdown) |
 | `ccc mcp` | Run as MCP server in stdio mode |
 | `ccc doctor` | Run diagnostics — checks settings, daemon, model, file matching, and index health |
@@ -190,7 +150,7 @@ The background daemon starts automatically on first use.
 | `ccc daemon restart` | Restart the background daemon |
 | `ccc daemon stop` | Stop the daemon |
 
-### Search Options
+### Search options
 
 ```bash
 ccc search database schema                           # basic search
@@ -198,64 +158,63 @@ ccc search --lang python --lang markdown schema      # filter by language
 ccc search --path 'src/utils/*' query handler        # filter by path
 ccc search --offset 10 --limit 5 database schema     # pagination
 ccc search --refresh database schema                 # update index first, then search
+ccc search --branch feature/login "auth flow"        # search a git branch (see Branch search)
 ```
 
 By default, `ccc search` scopes results to your current working directory (relative to the project root). Use `--path` to override.
 
+## Branch search
+
+The index is built from the **checked-out working tree** — normally the branch a deployment keeps reset to (the *base*). Branch search lets you query **any other git branch** without maintaining a full index per branch: it builds a small, ephemeral overlay from just the files the branch changed and merges it with the base index.
+
+- **Omit `branch`** (or pass the base ref) → searches the base index, exactly as before, zero overhead.
+- **Low-divergence branch** → a semantic **overlay**: the branch's version of its added/modified files is embedded into an ephemeral `overlay_<sha>` table, and the search returns that overlay merged with the base index *minus the files the branch touched* (so you never get a stale base version of a modified file). All results are `source: "semantic"`.
+- **High-divergence branch** (over `COCOINDEX_CODE_BRANCH_MAX_CHANGED_FILES`) → a **lexical fallback**: semantic results over the base (minus the changed files) plus a keyword scan of the branch's changed files, returned as a distinct `source: "lexical"` section instead of embedding a huge diff.
+
+Overlays are cached per commit SHA (a new commit invalidates the old one) and evicted when not searched within `COCOINDEX_CODE_BRANCH_OVERLAY_TTL_DAYS`.
+
+```bash
+ccc search --branch feature/login "session handling"
+```
+
+| Env var | Default | Effect |
+|---|---|---|
+| `COCOINDEX_CODE_BASE_REF` | auto (`HEAD`) | The ref the base index represents / the diff base. Auto-detected from the checked-out branch; override when it differs. |
+| `COCOINDEX_CODE_BRANCH_MAX_CHANGED_FILES` | `50` | Above this many changed files, use the lexical fallback instead of a semantic overlay. |
+| `COCOINDEX_CODE_BRANCH_OVERLAY_TTL_DAYS` | `7` | Evict an overlay not searched within this many days. |
+
+> **Current limitations.** The requested branch must already exist in the server's local clone — on-demand `git fetch` is not enabled yet. The hardened read-only git guarantee layer is also deferred. Both are tracked in [`docs/branch-search.md`](./docs/branch-search.md) (Future work), which documents the full design.
+
 ## Docker
 
-A Docker image is available for teams who want a reproducible, dependency-free
-setup — no Python, `uv`, or system dependencies required on the host.
+A Docker image gives a reproducible, dependency-free setup — no Python, `uv`, or system deps on the host. Build it locally first (see [Install & run](#install--run)); this fork does not publish images.
 
-The recommended approach is a **persistent container**: start it once, and use
-`docker exec` to run CLI commands or connect MCP sessions to it. The daemon
-inside stays warm across sessions, so the embedding model is loaded only once.
+The recommended approach is a **persistent container**: start it once and use `docker exec` to run CLI commands or connect MCP sessions. The daemon inside stays warm across sessions, so the embedding model loads only once.
 
-### Choosing an image
+### Build variants
 
-Two variants are published from each release:
+Chosen at build time via the `CCC_VARIANT` build arg:
 
-| Tag | Size | Embedding backends | When to pick |
+| Variant | Size | Embedding backends | When to pick |
 |---|---|---|---|
-| `cocoindex/cocoindex-code:latest` (slim, default) | ~450 MB | LiteLLM (cloud: OpenAI, Voyage, Gemini, Ollama, …) | Most users. Cloud-backed embeddings, smaller image, fast pulls. |
-| `cocoindex/cocoindex-code:full` | ~5 GB | sentence-transformers (local) + LiteLLM | When you want local embeddings without an API key, or an offline-ready container. Heavier because of torch + transformers. |
+| slim (default) | ~450 MB | LiteLLM (cloud: OpenAI, Voyage, Gemini, Ollama, …) | Cloud-backed embeddings, smaller image, fast builds. |
+| full (`--build-arg CCC_VARIANT=full`) | ~5 GB | sentence-transformers (local) + LiteLLM | Local embeddings without an API key, or an offline-ready container. Heavier (torch + transformers). |
 
-The rest of this section uses `:latest` — substitute `:full` in the `image:` /
-`docker run` commands if you want the full variant.
+> **Mac users running the full variant:** local embedding inference is CPU-only inside Docker (Docker on macOS can't access Apple's Metal/MPS GPU). For fast local embeddings, install natively instead (`uv tool install '.[full]'`). The slim variant is unaffected — LiteLLM runs the model provider-side.
 
-> **Mac users running the `:full` variant:** local embedding inference is
-> CPU-only inside Docker, because Docker on macOS can't access Apple's Metal
-> (MPS) GPU. If you want local embeddings and fast inference, install
-> natively instead: `pipx install 'cocoindex-code[full]'`. The `:latest`
-> (slim) variant is unaffected — LiteLLM runs the model on the provider's
-> side, so Docker vs. native makes no difference.
+### Run with `docker compose`
 
-### Quick start — `docker compose up -d`
-
-Bring it up in one line — no clone needed (bash / zsh):
+Grab [`docker/docker-compose.yml`](./docker/docker-compose.yml) and point it at the image you built:
 
 ```bash
 # macOS / Windows
-docker compose -f <(curl -L https://raw.githubusercontent.com/cocoindex-io/cocoindex-code/refs/heads/main/docker/docker-compose.yml) up -d
+COCOINDEX_CODE_IMAGE=cocoindex-code:local docker compose up -d
 
 # Linux (aligns file ownership on bind-mounted paths with your host user)
-PUID=$(id -u) PGID=$(id -g) docker compose -f <(curl -L https://raw.githubusercontent.com/cocoindex-io/cocoindex-code/refs/heads/main/docker/docker-compose.yml) up -d
+PUID=$(id -u) PGID=$(id -g) COCOINDEX_CODE_IMAGE=cocoindex-code:local docker compose up -d
 ```
 
-Or grab [`docker/docker-compose.yml`](./docker/docker-compose.yml) and run `docker compose up -d` next to it (works on any shell, including Windows cmd / PowerShell).
-
-By default your home directory is mounted into the container (set
-`COCOINDEX_HOST_WORKSPACE` to narrow this to a specific code folder). Index
-data and the embedding model cache persist in a Docker volume across
-restarts. Your global settings file at `$HOME/.cocoindex_code/global_settings.yml`
-is visible and editable on the host; edits take effect on your next `ccc` command.
-
-> **Pick a different image:** set `COCOINDEX_CODE_IMAGE` to override the
-> default. For example, the `:full` variant or GHCR:
-> ```bash
-> COCOINDEX_CODE_IMAGE=cocoindex/cocoindex-code:full docker compose up -d
-> COCOINDEX_CODE_IMAGE=ghcr.io/cocoindex-io/cocoindex-code:latest docker compose up -d
-> ```
+By default your home directory is mounted into the container (set `COCOINDEX_HOST_WORKSPACE` to narrow this to a specific code folder). Index data and the embedding model cache persist in a Docker volume across restarts. Your global settings file at `$HOME/.cocoindex_code/global_settings.yml` is visible and editable on the host; edits take effect on your next `ccc` command.
 
 ### Or: `docker run`
 
@@ -267,7 +226,7 @@ docker run -d --name cocoindex-code \
   --volume "$HOME:/workspace" \
   --volume cocoindex-data:/var/cocoindex \
   -e COCOINDEX_CODE_HOST_PATH_MAPPING="/workspace=$HOME" \
-  cocoindex/cocoindex-code:latest
+  cocoindex-code:local
 ```
 </details>
 
@@ -280,14 +239,13 @@ docker run -d --name cocoindex-code \
   --volume "$HOME:/workspace" \
   --volume cocoindex-data:/var/cocoindex \
   -e COCOINDEX_CODE_HOST_PATH_MAPPING="/workspace=$HOME" \
-  cocoindex/cocoindex-code:latest
+  cocoindex-code:local
 ```
 </details>
 
 ### Shell wrapper for `ccc` commands
 
-Paste this into `~/.bashrc` / `~/.zshrc` so `ccc` feels native on the host
-and picks up the right project based on your current directory:
+Paste this into `~/.bashrc` / `~/.zshrc` so `ccc` feels native on the host and picks up the right project based on your current directory:
 
 ```bash
 ccc() {
@@ -295,8 +253,7 @@ ccc() {
 }
 ```
 
-Now `cd` into any project under your workspace and run `ccc init`, `ccc index`,
-`ccc search ...`, `ccc status`, etc. — it just works.
+Now `cd` into any project under your workspace and run `ccc init`, `ccc index`, `ccc search ...`, `ccc status`, etc.
 
 ### Connect your coding agent
 
@@ -310,31 +267,7 @@ claude mcp add cocoindex-code -- docker exec -i \
   -e COCOINDEX_CODE_HOST_CWD="$PWD" cocoindex-code ccc mcp
 ```
 
-Or via `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "cocoindex-code": {
-      "type": "stdio",
-      "command": "docker",
-      "args": [
-        "exec",
-        "-i",
-        "-e",
-        "COCOINDEX_CODE_HOST_CWD=${PWD}",
-        "cocoindex-code",
-        "ccc",
-        "mcp"
-      ]
-    }
-  }
-}
-```
-
-> Note: use `-i` (not `-it`). The `-t` flag allocates a terminal, which
-> interferes with MCP's JSON messaging over stdin/stdout — only add it for
-> interactive `ccc` commands like `ccc init`.
+> Use `-i` (not `-it`). The `-t` flag allocates a terminal, which interferes with MCP's JSON messaging over stdin/stdout — only add it for interactive `ccc` commands like `ccc init`.
 </details>
 
 <details>
@@ -345,19 +278,6 @@ codex mcp add cocoindex-code -- docker exec -i \
   -e COCOINDEX_CODE_HOST_CWD="$PWD" cocoindex-code ccc mcp
 ```
 </details>
-
-### Upgrading from an older image
-
-Earlier images used separate `cocoindex-db` and `cocoindex-model-cache`
-volumes; the current image consolidates them into a single `cocoindex-data`
-volume. Before pulling the new image, drop the old container and volumes —
-indexes rebuild on your next `ccc index`, and the embedding model is
-re-populated automatically on first start:
-
-```bash
-docker rm -f cocoindex-code
-docker volume rm cocoindex-db cocoindex-model-cache
-```
 
 ### Configuration via environment variables
 
@@ -374,35 +294,24 @@ Pass configuration to `docker run` / compose with `-e`:
 -e VOYAGE_API_KEY=your-key
 ```
 
-> **Security note:** mounting `$HOME` gives the container read/write access
-> to everything under it. If that's too broad, bind-mount a narrower
-> directory instead (`COCOINDEX_HOST_WORKSPACE=/path/to/code`).
+> **Security note:** mounting `$HOME` gives the container read/write access to everything under it. If that's too broad, bind-mount a narrower directory instead (`COCOINDEX_HOST_WORKSPACE=/path/to/code`).
 
 ### Limiting memory
 
-Indexing is memory-hungry: the engine keeps many files in flight at once
-(each holding its text, chunks, and embedding vectors) and — with local
-embeddings — the model weights are resident too. In a memory-capped container
-this can trip the kernel's OOM killer.
+Indexing is memory-hungry: the engine keeps many files in flight at once (each holding its text, chunks, and embedding vectors) and — with local embeddings — the model weights are resident too. In a memory-capped container this can trip the kernel's OOM killer.
 
-The daemon **detects the container's memory limit and sizes itself to fit**:
-it reads the cgroup limit at startup, caps how many files it indexes
-concurrently so the working set stays within budget, and throttles that
-concurrency further in real time as usage approaches the limit. So you just
-set a limit the normal Docker way — no app-specific configuration required.
+The daemon **detects the container's memory limit and sizes itself to fit**: it reads the cgroup limit at startup, caps how many files it indexes concurrently so the working set stays within budget, and throttles that concurrency further in real time as usage approaches the limit. So you just set a limit the normal Docker way — no app-specific configuration required.
 
-**Docker Compose** — set `COCOINDEX_MEM_LIMIT` (the bundled compose file wires
-it into `mem_limit` / `memswap_limit`, defaulting to `2g`):
+**Docker Compose** — set `COCOINDEX_MEM_LIMIT` (the bundled compose file wires it into `mem_limit` / `memswap_limit`, defaulting to `2g`):
 
 ```bash
-COCOINDEX_MEM_LIMIT=4g docker compose up -d
+COCOINDEX_MEM_LIMIT=4g COCOINDEX_CODE_IMAGE=cocoindex-code:local docker compose up -d
 ```
 
-**`docker run`** — use the standard `--memory` flag (match `--memory-swap` to
-it so the cap can't be masked by swap):
+**`docker run`** — use the standard `--memory` flag (match `--memory-swap` to it so the cap can't be masked by swap):
 
 ```bash
-docker run --memory 4g --memory-swap 4g ... cocoindex/cocoindex-code:latest
+docker run --memory 4g --memory-swap 4g ... cocoindex-code:local
 ```
 
 **Verify** what the daemon detected and how it budgeted:
@@ -422,31 +331,20 @@ docker exec cocoindex-code ccc doctor   # see the "Memory" check
 -e COCOINDEX_CODE_MAX_INFLIGHT_FILES=32
 ```
 
-The images also set `MALLOC_ARENA_MAX=2` to keep native (torch / Arrow / Lance)
-allocations from fragmenting resident memory upward over time. If you need to
-squeeze RSS further, preloading a `jemalloc`/`tcmalloc` allocator via
-`LD_PRELOAD` is the next lever.
+The images also set `MALLOC_ARENA_MAX=2` to keep native (torch / Arrow / Lance) allocations from fragmenting resident memory upward over time. If you need to squeeze RSS further, preloading a `jemalloc`/`tcmalloc` allocator via `LD_PRELOAD` is the next lever.
 
-> If no memory limit is detected (e.g. an unconstrained container or a
-> non-Linux host), indexing falls back to the engine default with no runtime
-> throttling — `ccc doctor` flags this so you can set
-> `COCOINDEX_CODE_MEMORY_LIMIT_MB` to re-enable the guard.
+> If no memory limit is detected (e.g. an unconstrained container or a non-Linux host), indexing falls back to the engine default with no runtime throttling — `ccc doctor` flags this so you can set `COCOINDEX_CODE_MEMORY_LIMIT_MB` to re-enable the guard.
 
 ### Scheduled maintenance & git sync
 
-The daemon runs one **daily maintenance workflow** that, for each target repo, does
-three steps in order — each **best-effort**, so a failure in one is logged and the
-next still runs:
+The daemon runs one **daily maintenance workflow** that, for each target repo, does these steps in order — each **best-effort**, so a failure in one is logged and the next still runs:
 
-1. **git pull** — fetch and hard-reset the working tree to its upstream (opt-in;
-   skipped for non-git directories),
+1. **git pull** — fetch and hard-reset the working tree to its upstream (opt-in; skipped for non-git directories),
 2. **index** — an incremental index pass over the refreshed tree,
-3. **push metrics** — write an index-stats snapshot to MySQL (only when the
-   `COCOINDEX_CODE_METRICS_*` target is configured).
+3. **push metrics** — write an index-stats snapshot to MySQL (only when the `COCOINDEX_CODE_METRICS_*` target is configured),
+4. **evict overlays** — drop branch-search overlays past their TTL (see [Branch search](#branch-search)).
 
-It replaces the old separate reindex/metrics timers with a single schedule. In the
-Docker image it targets the mounted repo (`/workspace`) at 03:00 local by default.
-Run any step on demand with `ccc pull` (step 1) and `ccc index` (step 2).
+In the Docker image it targets the mounted repo (`/workspace`) at 03:00 local by default. Run steps on demand with `ccc pull` (step 1) and `ccc index` (step 2).
 
 | Env var | Default | Effect |
 |---|---|---|
@@ -457,37 +355,21 @@ Run any step on demand with `ccc pull` (step 1) and `ccc index` (step 2).
 | `COCOINDEX_CODE_GIT_USERNAME` | — | Optional HTTPS username (for a token, any non-empty value, e.g. `x-access-token`) |
 | `COCOINDEX_CODE_GIT_PASSWORD` | — | Optional HTTPS password / personal-access token |
 
-> **The git-pull step is destructive by design.** It runs `git fetch` then
-> `git reset --hard` to the upstream branch, discarding any local changes to
-> **tracked** files — it's built for repos kept as read-only mirrors. Untracked
-> and ignored files (including `.cocoindex_code/`) are never touched. It's **off
-> by default**; enable it only where that's what you want.
+> **The git-pull step is destructive by design.** It runs `git fetch` then `git reset --hard` to the upstream branch, discarding any local changes to **tracked** files — it's built for repos kept as read-only mirrors. Untracked and ignored files (including `.cocoindex_code/`) are never touched. It's **off by default**; enable it only where that's what you want.
 
-**Authentication.** For SSH remotes, host auth is used (SSH key / agent). For HTTPS,
-set `COCOINDEX_CODE_GIT_USERNAME` / `COCOINDEX_CODE_GIT_PASSWORD` — they're injected
-via an inline git credential helper scoped to the fetch, so the token is **never
-written to disk, never placed in the remote URL, and never in the process argv**.
-(A container has no access to host credential helpers like the macOS Keychain, so
-supplying a token this way, or an SSH key/agent, is required.)
+**Authentication.** For SSH remotes, host auth is used (SSH key / agent). For HTTPS, set `COCOINDEX_CODE_GIT_USERNAME` / `COCOINDEX_CODE_GIT_PASSWORD` — they're injected via an inline git credential helper scoped to the fetch, so the token is **never written to disk, never placed in the remote URL, and never in the process argv**. (A container has no access to host credential helpers like the macOS Keychain, so supplying a token this way, or an SSH key/agent, is required.)
 
-**Diagnostics.** When git pull is enabled, `ccc doctor` runs a read-only
-`git ls-remote` **connectivity probe** ("Git pull" check) so a broken remote or bad
-credentials surfaces before the next scheduled pull. Any credentials embedded in a
-remote URL are masked in the output.
-
-### Build the image locally
-
-```bash
-docker build -t cocoindex-code:local -f docker/Dockerfile .
-```
+**Diagnostics.** When git pull is enabled, `ccc doctor` runs a read-only `git ls-remote` **connectivity probe** ("Git pull" check) so a broken remote or bad credentials surfaces before the next scheduled pull. Any credentials embedded in a remote URL are masked in the output.
 
 ## Features
-- **Semantic Code Search**: Find relevant code using natural language queries when grep doesn't work well, and save tokens immediately.
-- **Ultra Performant**: ⚡ Built on top of ultra performant [Rust indexing engine](https://github.com/cocoindex-io/cocoindex). Only re-indexes changed files for fast updates.
-- **Multi-Language Support**: Python, JavaScript/TypeScript, Rust, Go, Java, C/C++, C#, SQL, Shell, and more.
-- **Embedded**: Portable and just works, no database setup required!
-- **Built for concurrency**: An embedded [LanceDB](https://lancedb.github.io/lancedb/) + HNSW vector store serves searches concurrently — even while an index pass is writing — so multiple agents (or MCP sessions) can query in parallel without blocking. See [Vector Search Backend](#vector-search-backend-lancedb--hnsw).
-- **Flexible Embeddings**: Local SentenceTransformers via the `[full]` extra (free, no API key!) or 100+ cloud providers via LiteLLM.
+
+- **Semantic code search**: find relevant code using natural language queries when grep doesn't work well, and save tokens immediately.
+- **Long-running service**: a warm daemon serves the CLI and MCP (stdio + HTTP) with the model loaded once.
+- **Branch search**: query arbitrary git branches via ephemeral diff overlays (see [Branch search](#branch-search)).
+- **Ultra performant**: ⚡ built on the [CocoIndex](https://github.com/cocoindex-io/cocoindex) Rust indexing engine. Only re-indexes changed files for fast updates.
+- **Multi-language support**: Python, JavaScript/TypeScript, Rust, Go, Java, C/C++, C#, SQL, Shell, and more (see [Supported languages](#supported-languages)).
+- **Built for concurrency**: an embedded [LanceDB](https://lancedb.github.io/lancedb/) + HNSW vector store serves searches concurrently — even while an index pass is writing — so multiple agents (or MCP sessions) query in parallel without blocking. See [Vector search backend](#vector-search-backend-lancedb--hnsw).
+- **Flexible embeddings**: local SentenceTransformers via the `[full]` extra (free, no API key) or 100+ cloud providers via LiteLLM.
 
 ## Configuration
 
@@ -495,7 +377,7 @@ For a detailed guide on choosing and configuring embedding models, see [EMBEDDIN
 
 Configuration lives in two YAML files, both created automatically by `ccc init`.
 
-### User Settings (`~/.cocoindex_code/global_settings.yml`)
+### User settings (`~/.cocoindex_code/global_settings.yml`)
 
 Shared across all projects. Controls the embedding model and environment variables for the daemon.
 
@@ -546,7 +428,7 @@ OpenAI embeddings (`text-embedding-3-*`, `text-embedding-ada-002`) are intention
 
 **Legacy-bridge warning:** if you're upgrading from an earlier version and your `global_settings.yml` uses `nomic-ai/CodeRankEmbed` or `nomic-ai/nomic-embed-code` without `indexing_params` / `query_params`, the daemon continues to apply the previous behavior (`prompt_name: query` at query time) and prints a one-time warning asking you to make the setting explicit. You can silence the warning by adding an empty block such as `query_params: {}`.
 
-### Project Settings (`<project>/.cocoindex_code/settings.yml`)
+### Project settings (`<project>/.cocoindex_code/settings.yml`)
 
 Per-project. Controls which files to index.
 
@@ -606,14 +488,14 @@ def my_chunker(path: Path, content: str) -> tuple[str | None, list[Chunk]]:
 
 See [`src/cocoindex_code/chunking.py`](./src/cocoindex_code/chunking.py) for the public types and [`tests/example_toml_chunker.py`](./tests/example_toml_chunker.py) for a complete example.
 
-## Embedding Models
+## Embedding models
 
 With the `[full]` extra installed, `ccc init` defaults to a local SentenceTransformers model ([Snowflake/snowflake-arctic-embed-xs](https://huggingface.co/Snowflake/snowflake-arctic-embed-xs)) — no API key required. To use a different model, edit `~/.cocoindex_code/global_settings.yml`.
 
 > The `envs` entries below are only needed if the key isn't already in your shell environment — the daemon inherits your environment automatically.
 
 <details>
-<summary>Ollama (Local)</summary>
+<summary>Ollama (local)</summary>
 
 ```yaml
 embedding:
@@ -693,7 +575,7 @@ envs:
 </details>
 
 <details>
-<summary>Voyage (Code-Optimized)</summary>
+<summary>Voyage (code-optimized)</summary>
 
 ```yaml
 embedding:
@@ -744,7 +626,7 @@ envs:
 
 Any [LiteLLM-supported model](https://docs.litellm.ai/docs/embedding/supported_embedding) works. When using a LiteLLM model, set `provider: litellm` (or omit `provider` — LiteLLM is the default for non-`sentence-transformers` models). For the full list of env vars each provider reads (API keys, base URLs, regions, …), see LiteLLM's [Setting API Keys](https://docs.litellm.ai/docs/set_keys).
 
-### Local SentenceTransformers Models
+### Local SentenceTransformers models
 
 Set `provider: sentence-transformers` and use any [SentenceTransformers](https://www.sbert.net/) model (no API key required).
 
@@ -767,7 +649,7 @@ embedding:
 
 **Note:** Switching models requires re-indexing your codebase (`ccc reset && ccc index`) since the vector dimensions differ.
 
-## Supported Languages
+## Supported languages
 
 | Language | Aliases | File Extensions |
 |----------|---------|-----------------|
@@ -803,7 +685,7 @@ embedding:
 | xml | | `.xml` |
 | yaml | | `.yaml`, `.yml` |
 
-### Custom Database Location
+### Custom database location
 
 By default, the index databases live alongside settings in `<project>/.cocoindex_code/`: `cocoindex.db` (the LMDB incremental-indexing state) and `lancedb/` (the LanceDB vector store directory). When running in Docker, you may want the databases on the container's native filesystem for performance (LMDB doesn't work well on mounted volumes) while keeping the source code and settings on a mounted volume.
 
@@ -823,18 +705,18 @@ COCOINDEX_CODE_DB_PATH_MAPPING=/workspace=/db-files,/workspace2=/db-files2
 
 Both source and target must be absolute paths. If no mapping matches, the default location is used.
 
-## Vector Search Backend (LanceDB + HNSW)
+## Vector search backend (LanceDB + HNSW)
 
-Chunk embeddings are stored in an embedded **[LanceDB](https://lancedb.github.io/lancedb/)** table (`lancedb/code_chunks.lance` under your index directory). LanceDB runs in-process — no separate server — so the tool stays zero-config, while supporting concurrent reads for the MCP server.
+Chunk embeddings are stored in an embedded **[LanceDB](https://lancedb.github.io/lancedb/)** table (`lancedb/code_chunks.lance` under your index directory). LanceDB runs in-process — no separate server — so the tool stays zero-config, while supporting concurrent reads for the MCP server. Branch overlays are sibling `lancedb/overlay_<sha>.lance` tables (see [Branch search](#branch-search)).
 
-**Approximate nearest-neighbour (HNSW).** Once a codebase grows past a few hundred chunks, the embedding column is indexed with an **HNSW graph using cosine distance**. HNSW makes query latency *sublinear* in codebase size, versus the previous exact brute-force scan that grew linearly. The index is built automatically after indexing and maintained incrementally on subsequent updates.
+**Approximate nearest-neighbour (HNSW).** Once a codebase grows past a few hundred chunks, the embedding column is indexed with an **HNSW graph using cosine distance**. HNSW makes query latency *sublinear* in codebase size, versus an exact brute-force scan that grows linearly. The index is built automatically after indexing and maintained incrementally on subsequent updates.
 
 - **Small indexes** (below 256 chunks) skip the ANN index entirely and use LanceDB's exact flat scan — it's already fast at that size and avoids approximation.
 - **HNSW is approximate**, so recall is < 100%. The defaults (`m=20`, `ef_construction=300`, query-time `ef=256`) favor recall for typical top-k code search. These live in `cocoindex_code/lancedb_store.py`; raise `ef` for more recall, lower it for less latency.
 
-**Scoring.** Results carry a `score` that is cosine similarity (`1 − cosine_distance`), in the same `0..1`-is-better range as before (1.0 = identical).
+**Scoring.** Semantic results carry a `score` that is cosine similarity (`1 − cosine_distance`), in a `0..1`-is-better range (1.0 = identical).
 
-**Filtering parity and one delta.** Language filters (`--lang`) are exact matches. Path filters (`--path`) accept the same `*` / `?` GLOB wildcards as before — these are translated to LanceDB's SQL `LIKE` (`*`→`%`, `?`→`_`). The one behavioral delta from the old sqlite-vec backend: GLOB character classes (e.g. `[abc]`) are **not** supported and are treated as literal text.
+**Filtering parity and one delta.** Language filters (`--lang`) are exact matches. Path filters (`--path`) accept `*` / `?` GLOB wildcards, translated to LanceDB's SQL `LIKE` (`*`→`%`, `?`→`_`). The one behavioral delta from the old sqlite-vec backend: GLOB character classes (e.g. `[abc]`) are **not** supported and are treated as literal text.
 
 **Re-indexing.** Switching embedding models (different vector dimensions) requires a rebuild: `ccc reset && ccc index`. Vectors are re-exported from source — there's no in-place migration of raw vectors.
 
@@ -886,9 +768,7 @@ ccc daemon restart
 ccc index
 ```
 
-> This manual step is temporary. Once [cocoindex#2108](https://github.com/cocoindex-io/cocoindex/issues/2108) lands, the map size grows automatically when needed and `COCOINDEX_LMDB_MAP_SIZE` won't be necessary.
-
-## Legacy: Environment Variables
+## Legacy: environment variables
 
 If you previously configured `cocoindex-code` via environment variables, the `cocoindex-code` MCP command still reads them and auto-migrates to YAML settings on first run. We recommend switching to the YAML settings for new setups.
 
@@ -902,9 +782,7 @@ If you previously configured `cocoindex-code` via environment variables, the `co
 
 ## Telemetry
 
-`cocoindex-code` sends anonymous usage telemetry through CocoIndex so we can see how the tool is used in aggregate and prioritize improvements. The events identify themselves as `application: cocoindex-code`.
-
-We **do not** collect your source code, file paths, queries, search results, embeddings, settings, or any other content from your codebase or environment.
+The underlying [CocoIndex](https://github.com/cocoindex-io/cocoindex) engine sends anonymous usage telemetry so aggregate usage can be understood. The events identify themselves as `application: cocoindex-code`. **No** source code, file paths, queries, search results, embeddings, or settings are collected.
 
 To opt out, set:
 
@@ -912,45 +790,24 @@ To opt out, set:
 export COCOINDEX_DISABLE_USAGE_TRACKING=1
 ```
 
-## Large codebase / Enterprise
-[CocoIndex](https://github.com/cocoindex-io/cocoindex) is an ultra efficient indexing engine that also works on large codebases at scale for enterprises. In enterprise scenarios it is a lot more efficient to share indexes with teammates when there are large or many repos. We also have advanced features like branch dedupe etc designed for enterprise users.
-
-> Indexing a very large codebase and hitting `MDB_MAP_FULL`? Raise the LMDB map size — see [`MDB_MAP_FULL: Environment mapsize limit reached`](#mdb_map_full-environment-mapsize-limit-reached) under Troubleshooting.
-
-If you need help with remote setup, please email our maintainer linghua@cocoindex.io, happy to help!
-
 ## Contributing
 
-We welcome contributions! This project uses [uv](https://docs.astral.sh/uv/getting-started/installation/) for development, and every PR is gated on the same lint, format, type-check, and test suite in CI. **Please run these checks locally before opening a PR** — failing pre-commit checks are the most common cause of red CI on incoming PRs.
-
-### 1. Install the dev dependencies
-
-After installing [uv](https://docs.astral.sh/uv/getting-started/installation/), sync the project. This installs everything the checks need — including [prek](https://github.com/j178/prek), a fast pre-commit runner, plus Ruff, mypy, and pytest:
+This project uses [uv](https://docs.astral.sh/uv/getting-started/installation/) for development. Before opening a PR, run the same checks CI runs:
 
 ```bash
-uv sync
+uv sync                          # install dev dependencies (Ruff, mypy, pytest, prek)
+uv run prek run --all-files      # trailing-whitespace/EOF, Ruff lint+format, mypy, pytest
 ```
 
-### 2. Run all checks before every PR
-
-Run the full hook suite across all files — this is exactly what CI runs:
+Or run the individual checks directly:
 
 ```bash
-uv run prek run --all-files
+uv run mypy .            # type check
+uv run pytest tests/     # test suite
 ```
 
-It runs trailing-whitespace/end-of-file fixes, Ruff lint (`--fix`) and format, `uv.lock` validation, mypy type checking, and the pytest suite. Fix anything it reports (Ruff auto-fixes most lint/format issues for you), re-run until it passes, then push.
-
-### 3. (Optional) Run automatically on each commit
-
-To have the same checks run on every `git commit`, install the git hook once:
-
-```bash
-uv run prek install
-```
-
-For more details, see our [contributing guide](https://cocoindex.io/docs/contributing/guide).
+To have the checks run on every `git commit`, install the hook once with `uv run prek install`.
 
 ## License
 
-Apache-2.0
+Apache-2.0. This is a fork of [cocoindex-io/cocoindex-code](https://github.com/cocoindex-io/cocoindex-code); upstream copyright and license are retained.

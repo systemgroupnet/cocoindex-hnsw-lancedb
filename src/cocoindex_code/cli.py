@@ -177,7 +177,9 @@ def print_search_results(response: SearchResponse) -> None:
         return
 
     for i, r in enumerate(response.results, 1):
-        _typer.echo(f"\n--- Result {i} (score: {r.score:.3f}) ---")
+        # Only annotate non-default sources so plain searches stay uncluttered.
+        tag = "" if r.source == "semantic" else f" {{{r.source}}}"
+        _typer.echo(f"\n--- Result {i} (score: {r.score:.3f}){tag} ---")
         _typer.echo(f"File: {r.file_path}:{r.start_line}-{r.end_line} [{r.language}]")
         _typer.echo(r.content)
 
@@ -234,6 +236,7 @@ def _search_with_wait_spinner(
     paths: list[str] | None = None,
     limit: int = 10,
     offset: int = 0,
+    branch: str | None = None,
 ) -> SearchResponse:
     """Run search, showing a spinner if waiting for load-time indexing."""
     from rich.console import Console as _Console
@@ -264,6 +267,7 @@ def _search_with_wait_spinner(
             # daemon-side.
             refresh=False,
             on_waiting=_on_waiting,
+            branch=branch,
         )
 
     return resp
@@ -657,6 +661,9 @@ def search(
     offset: int = _typer.Option(0, "--offset", help="Number of results to skip"),
     limit: int = _typer.Option(10, "--limit", help="Maximum results to return"),
     refresh: bool = _typer.Option(False, "--refresh", help="Refresh index before searching"),
+    branch: str | None = _typer.Option(
+        None, "--branch", help="Git branch/ref to search (default: the checked-out base branch)"
+    ),
 ) -> None:
     """Semantic search across the codebase."""
     project_root = str(require_project_root())
@@ -681,6 +688,7 @@ def search(
         paths=paths,
         limit=limit,
         offset=offset,
+        branch=branch,
     )
     print_search_results(resp)
 

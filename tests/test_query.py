@@ -12,6 +12,8 @@ Two layers:
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +70,16 @@ def test_build_filter_combines_language_and_path() -> None:
 def test_build_filter_none_when_empty() -> None:
     assert _build_filter(None, None) is None
     assert _build_filter([], []) is None
+
+
+def test_build_filter_exclude_paths_only() -> None:
+    pred = _build_filter(None, None, ["a.py", "b.py"])
+    assert pred == "file_path NOT IN ('a.py', 'b.py')"
+
+
+def test_build_filter_combines_exclude_with_language() -> None:
+    pred = _build_filter(["python"], None, ["gone.py"])
+    assert pred == "language IN ('python') AND file_path NOT IN ('gone.py')"
 
 
 def test_build_filter_escapes_quotes_in_language() -> None:
@@ -229,4 +241,92 @@ async def test_pagination_offset_skips_results(tmp_path: Path) -> None:
     page2 = await project.search("alpha", limit=1, offset=1)
     assert page1 and page2
     assert page1[0].file_path != page2[0].file_path
+    project.close()
+
+
+# ---------------------------------------------------------------------------
+# Branch search: overlay on a real git repo (deterministic keyword embedder)
+# ---------------------------------------------------------------------------
+
+_needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.email=t@e.com", "-c", "user.name=T",
+         "-c", "commit.gpgsign=false", *args],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def _make_branch_repo(root: Path) -> None:
+    """main has a.py(alpha)+b.py(beta); feature changes a.py->gamma, adds c.py(delta)."""
+    _git(root, "init")
+    _git(root, "symbolic-ref", "HEAD", "refs/heads/main")
+    _write(root, "a.py", "alpha alpha alpha\n")
+    _write(root, "b.py", "beta beta beta\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "base")
+
+    _git(root, "checkout", "-b", "feature")
+    _write(root, "a.py", "gamma gamma gamma\n")
+    _write(root, "c.py", "delta delta delta\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "feature")
+    _git(root, "checkout", "main")  # leave the working tree on the base
+
+
+@_needs_git
+async def test_branch_overlay_returns_branch_version(tmp_path: Path) -> None:
+    """A branch search surfaces the branch's version of a modified file."""
+    _make_branch_repo(tmp_path)
+    project = await _make_project(tmp_path)
+    await project.run_index()  # indexes 'main' (the base)
+
+    # On the base, 'gamma' matches nothing strongly; on 'feature', a.py is gamma.
+    results = await project.search("gamma", limit=5, branch="feature")
+    assert results
+    assert results[0].file_path == "a.py"
+    assert results[0].source == "semantic"
+    assert "gamma" in results[0].content
+    project.close()
+
+
+@_needs_git
+async def test_branch_search_shadows_stale_base_file(tmp_path: Path) -> None:
+    """The base version of a file the branch modified must not leak through."""
+    _make_branch_repo(tmp_path)
+    project = await _make_project(tmp_path)
+    await project.run_index()
+
+    # 'alpha' was a.py on the base, but the branch replaced it with 'gamma'. The
+    # branch search must never return the stale base (alpha) a.py.
+    results = await project.search("alpha", limit=5, branch="feature")
+    for r in results:
+        if r.file_path == "a.py":
+            assert "alpha" not in r.content, "stale base version of a.py leaked into branch search"
+    project.close()
+
+
+@_needs_git
+async def test_branch_search_unknown_ref_raises(tmp_path: Path) -> None:
+    _make_branch_repo(tmp_path)
+    project = await _make_project(tmp_path)
+    await project.run_index()
+
+    with pytest.raises(RuntimeError, match="not found in the local clone"):
+        await project.search("gamma", limit=5, branch="no-such-branch")
+    project.close()
+
+
+@_needs_git
+async def test_branch_equal_to_base_is_plain_search(tmp_path: Path) -> None:
+    """Passing the base ref as the branch is a normal base search (no overlay)."""
+    _make_branch_repo(tmp_path)
+    project = await _make_project(tmp_path)
+    await project.run_index()
+
+    results = await project.search("alpha", limit=5, branch="main")
+    assert results and results[0].file_path == "a.py"
+    assert "alpha" in results[0].content
     project.close()
