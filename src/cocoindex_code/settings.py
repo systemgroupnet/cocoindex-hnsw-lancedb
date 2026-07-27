@@ -155,7 +155,9 @@ def default_project_settings() -> ProjectSettings:
 # Path helpers
 # ---------------------------------------------------------------------------
 
-_SETTINGS_DIR_NAME = ".cocoindex_code"
+# Public: other modules need the name to keep it out of their own scans (e.g.
+# the ripgrep tool excludes it from the working tree).
+SETTINGS_DIR_NAME = ".cocoindex_code"
 _SETTINGS_FILE_NAME = "settings.yml"  # project-level
 _USER_SETTINGS_FILE_NAME = "global_settings.yml"  # user-level
 
@@ -237,7 +239,7 @@ def resolve_db_dir(project_root: Path) -> Path:
         if resolved == mapping.source or resolved.is_relative_to(mapping.source):
             rel = resolved.relative_to(mapping.source)
             return mapping.target / rel
-    return project_root / _SETTINGS_DIR_NAME
+    return project_root / SETTINGS_DIR_NAME
 
 
 def get_db_path_mappings() -> list[PathMapping]:
@@ -312,7 +314,7 @@ def user_settings_dir() -> Path:
     override = os.environ.get("COCOINDEX_CODE_DIR")
     if override:
         return Path(override)
-    return Path.home() / _SETTINGS_DIR_NAME
+    return Path.home() / SETTINGS_DIR_NAME
 
 
 def user_settings_path() -> Path:
@@ -322,7 +324,7 @@ def user_settings_path() -> Path:
 
 def project_settings_path(project_root: Path) -> Path:
     """Return ``$PROJECT_ROOT/.cocoindex_code/settings.yml``."""
-    return project_root / _SETTINGS_DIR_NAME / _SETTINGS_FILE_NAME
+    return project_root / SETTINGS_DIR_NAME / _SETTINGS_FILE_NAME
 
 
 def find_project_root(start: Path) -> Path | None:
@@ -332,7 +334,7 @@ def find_project_root(start: Path) -> Path | None:
     """
     current = start.resolve()
     while True:
-        if (current / _SETTINGS_DIR_NAME / _SETTINGS_FILE_NAME).is_file():
+        if (current / SETTINGS_DIR_NAME / _SETTINGS_FILE_NAME).is_file():
             return current
         parent = current.parent
         if parent == current:
@@ -348,7 +350,7 @@ def find_legacy_project_root(start: Path) -> Path | None:
     """
     current = start.resolve()
     while True:
-        if (current / _SETTINGS_DIR_NAME / _COCOINDEX_DB_NAME).exists():
+        if (current / SETTINGS_DIR_NAME / _COCOINDEX_DB_NAME).exists():
             return current
         parent = current.parent
         if parent == current:
@@ -375,7 +377,7 @@ def find_parent_with_marker(start: Path) -> Path | None:
         parent = current.parent
         if parent == current:
             return None
-        if (current / _SETTINGS_DIR_NAME / _SETTINGS_FILE_NAME).is_file() or (
+        if (current / SETTINGS_DIR_NAME / _SETTINGS_FILE_NAME).is_file() or (
             current / ".git"
         ).is_dir():
             return current

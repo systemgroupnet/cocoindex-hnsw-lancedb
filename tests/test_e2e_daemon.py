@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import time
 import urllib.request
@@ -125,6 +126,41 @@ def test_index_and_search_via_client(e2e_daemon: tuple[str, Path]) -> None:
     assert search_resp.success
     assert len(search_resp.results) > 0
     assert "main.py" in search_resp.results[0].file_path
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not installed")
+def test_ripgrep_via_client(e2e_daemon: tuple[str, Path]) -> None:
+    """`ccc grep` end to end: client -> daemon -> project -> rg."""
+    _, project_dir = e2e_daemon
+
+    resp = client.ripgrep(str(project_dir), "calculate_fibonacci", limit=10)
+    assert resp.success
+    assert resp.matches
+    assert all(m.file_path == "main.py" for m in resp.matches)
+    assert any("def calculate_fibonacci" in m.content for m in resp.matches)
+    assert resp.total_returned == len(resp.matches)
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not installed")
+def test_ripgrep_options_via_client(e2e_daemon: tuple[str, Path]) -> None:
+    """Limit, globs, case sensitivity, and context survive the round-trip."""
+    _, project_dir = e2e_daemon
+    root = str(project_dir)
+
+    capped = client.ripgrep(root, "fibonacci", limit=1)
+    assert len(capped.matches) == 1
+    assert capped.truncated is True
+
+    assert client.ripgrep(root, "fibonacci", globs=["*.md"]).matches == []
+    # The source spells it 'Fibonacci' in the docstring and 'fibonacci' in code.
+    assert client.ripgrep(root, "FIBONACCI", case_sensitive=True).matches == []
+    assert client.ripgrep(root, "FIBONACCI", case_sensitive=False).matches
+
+    with_context = client.ripgrep(root, "if n <= 1", fixed_strings=True, context_lines=1)
+    assert with_context.matches
+    match = with_context.matches[0]
+    assert match.end_line > match.start_line
+    assert "return n" in match.content
 
 
 def test_compact_via_client(e2e_daemon: tuple[str, Path]) -> None:

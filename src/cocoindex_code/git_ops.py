@@ -309,6 +309,33 @@ def fetch_ref(root: Path, ref: str, *, credentials: GitCredentials | None = None
     return None
 
 
+def fetch_all(root: Path, *, credentials: GitCredentials | None = None) -> str | None:
+    """``git fetch --prune`` every remote. Returns ``None`` on success, else why not.
+
+    Refreshes all remote-tracking refs — new branches, new commits on existing
+    ones, and pruning branches deleted upstream. Writes only objects and
+    ``refs/remotes/*``: HEAD, the index, and the working tree are untouched, so
+    this is safe to run while the base index's tree is being walked.
+    """
+    try:
+        proc = _run_git(
+            root,
+            "fetch",
+            "--all",
+            "--prune",
+            "--quiet",
+            credentials=credentials,
+            timeout=_FETCH_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return f"timed out after {_FETCH_TIMEOUT_SECONDS}s"
+    except OSError as e:
+        return f"could not be run: {e}"
+    if proc.returncode != 0:
+        return proc.stderr.strip() or "git fetch failed"
+    return None
+
+
 def resolve_commit(
     root: Path,
     ref: str,

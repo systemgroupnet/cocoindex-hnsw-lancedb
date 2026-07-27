@@ -16,7 +16,7 @@ import logging
 import os
 import time
 from pathlib import Path, PurePath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 from cocoindex.ops.text import detect_code_language
@@ -28,6 +28,7 @@ from .indexer import GitignoreAwareMatcher, chunk_file_content
 from .lexical import LexicalFile, lexical_search
 from .protocol import SearchResult
 from .query import open_table, query_codebase
+from .schedule import git_hard_reset_sync, git_pull_enabled
 from .schema import QueryResult
 from .settings import lancedb_dir_path, load_gitignore_spec, load_project_settings
 from .shared import (
@@ -47,9 +48,11 @@ logger = logging.getLogger(__name__)
 
 ENV_MAX_CHANGED_FILES = "COCOINDEX_CODE_BRANCH_MAX_CHANGED_FILES"
 ENV_OVERLAY_TTL_DAYS = "COCOINDEX_CODE_BRANCH_OVERLAY_TTL_DAYS"
+ENV_REFRESH_SECONDS = "COCOINDEX_CODE_BRANCH_REFRESH_SECONDS"
 
 _DEFAULT_MAX_CHANGED_FILES = 50
 _DEFAULT_TTL_DAYS = 7.0
+_DEFAULT_REFRESH_SECONDS = 60.0
 
 _SIDECAR_NAME = "overlays.json"
 
@@ -66,7 +69,7 @@ def _int_env(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
-def _float_env(name: str, default: float) -> float:
+def _float_env(name: str, default: float, *, allow_zero: bool = False) -> float:
     raw = os.environ.get(name, "").strip()
     if not raw:
         return default
@@ -75,11 +78,31 @@ def _float_env(name: str, default: float) -> float:
     except ValueError:
         logger.warning("%s=%r is not a number; using %s", name, raw, default)
         return default
-    return value if value > 0 else default
+    if value > 0 or (allow_zero and value == 0):
+        return value
+    return default
 
 
 def _overlay_table_name(sha: str) -> str:
     return f"overlay_{sha[:12]}"
+
+
+class BranchView(NamedTuple):
+    """A branch resolved against the base: what to read from it, what to hide.
+
+    Shared by every branch-aware search path (semantic overlay, lexical
+    fallback, ripgrep) so they all agree on what "the branch" contains.
+    """
+
+    sha: str
+    # Files to read from the branch — added + modified, filtered to what the
+    # base indexer would include.
+    branch_paths: list[str]
+    # Base paths to hide — modified + deleted, same filtering.
+    shadow_paths: list[str]
+    # Unfiltered count of changed files, which is what the divergence gate
+    # measures (a branch deleting 500 ignored files is still divergent).
+    total_changed: int
 
 
 class BranchOverlayManager:
@@ -95,6 +118,10 @@ class BranchOverlayManager:
         self._env = env
         self._root = project_root
         self._lock = asyncio.Lock()
+        # Separate from _lock so a slow refresh doesn't block overlay builds for
+        # branches that are already resolved.
+        self._refresh_lock = asyncio.Lock()
+        self._last_refresh: float | None = None
 
     # -- public API ----------------------------------------------------------
 
@@ -114,6 +141,48 @@ class BranchOverlayManager:
         Raises ``RuntimeError`` when the branch can't be resolved (locally or by
         fetching it) or the diff can't be computed.
         """
+        view = await self.resolve_branch(base_ref=base_ref, branch_ref=branch_ref)
+
+        await self.evict_stale()
+
+        main_table = await open_table(self._env)
+
+        # Branch identical to base (or only touches ignored files): plain search.
+        if not view.branch_paths and not view.shadow_paths:
+            rows = await query_codebase(
+                query, main_table, self._env,
+                limit=limit, offset=offset, languages=languages, paths=paths,
+            )
+            return [_to_result(r, "semantic") for r in rows]
+
+        if view.total_changed <= _int_env(ENV_MAX_CHANGED_FILES, _DEFAULT_MAX_CHANGED_FILES):
+            return await self._search_overlay(
+                query=query, branch_ref=branch_ref, branch_sha=view.sha,
+                main_table=main_table, embed_paths=view.branch_paths,
+                shadow_paths=view.shadow_paths,
+                languages=languages, paths=paths, limit=limit, offset=offset,
+            )
+
+        logger.info(
+            "Branch %s changed %d files (> %d); using lexical fallback",
+            branch_ref, view.total_changed,
+            _int_env(ENV_MAX_CHANGED_FILES, _DEFAULT_MAX_CHANGED_FILES),
+        )
+        return await self._search_lexical(
+            query=query, branch_sha=view.sha, main_table=main_table,
+            embed_paths=view.branch_paths, shadow_paths=view.shadow_paths,
+            languages=languages, paths=paths, limit=limit, offset=offset,
+        )
+
+    async def resolve_branch(self, *, base_ref: str, branch_ref: str) -> BranchView:
+        """Refresh the clone, resolve *branch_ref*, and diff it against the base.
+
+        The shared front half of every branch-aware search. Raises
+        ``RuntimeError`` when the ref can't be resolved (locally or by fetching
+        it) or the diff can't be computed.
+        """
+        await self._refresh_clone()
+
         # Resolution can fetch, so it runs off the event loop. Everything after
         # this point addresses the branch by SHA: the ref may live only as
         # `refs/remotes/<remote>/<branch>`, which `git diff`/`git show` would not
@@ -135,36 +204,44 @@ class BranchOverlayManager:
                 f"(is {base_ref!r} a valid ref?)"
             )
 
-        await self.evict_stale()
-
-        main_table = await open_table(self._env)
-
-        # Branch identical to base (or only touches ignored files): plain search.
-        embed_paths, shadow_paths = self._filter(diff)
-        if not embed_paths and not shadow_paths:
-            rows = await query_codebase(
-                query, main_table, self._env,
-                limit=limit, offset=offset, languages=languages, paths=paths,
-            )
-            return [_to_result(r, "semantic") for r in rows]
-
-        if diff.total_changed <= _int_env(ENV_MAX_CHANGED_FILES, _DEFAULT_MAX_CHANGED_FILES):
-            return await self._search_overlay(
-                query=query, branch_ref=branch_ref, branch_sha=branch_sha,
-                main_table=main_table, embed_paths=embed_paths, shadow_paths=shadow_paths,
-                languages=languages, paths=paths, limit=limit, offset=offset,
-            )
-
-        logger.info(
-            "Branch %s changed %d files (> %d); using lexical fallback",
-            branch_ref, diff.total_changed,
-            _int_env(ENV_MAX_CHANGED_FILES, _DEFAULT_MAX_CHANGED_FILES),
+        branch_paths, shadow_paths = self._filter(diff)
+        return BranchView(
+            sha=branch_sha,
+            branch_paths=branch_paths,
+            shadow_paths=shadow_paths,
+            total_changed=diff.total_changed,
         )
-        return await self._search_lexical(
-            query=query, branch_sha=branch_sha, main_table=main_table,
-            embed_paths=embed_paths, shadow_paths=shadow_paths,
-            languages=languages, paths=paths, limit=limit, offset=offset,
-        )
+
+    # -- pre-search clone refresh ---------------------------------------------
+
+    async def _refresh_clone(self) -> None:
+        """Bring the clone up to date before searching. Best-effort, never raises.
+
+        A branch is usually searched moments after it is pushed, so a search that
+        only reads whatever the last scheduled pull left behind is routinely
+        stale. Refreshing first means both the branch *and* the base it is diffed
+        against reflect the remote.
+
+        Throttled to one refresh per ``COCOINDEX_CODE_BRANCH_REFRESH_SECONDS``
+        (default 60, ``0`` to refresh on every search): an agent typically fires a
+        burst of searches, and each one paying a network round-trip buys nothing.
+        The timestamp is stamped on failure too, so an unreachable remote costs
+        one timeout per interval rather than one per search.
+        """
+        interval = _float_env(ENV_REFRESH_SECONDS, _DEFAULT_REFRESH_SECONDS, allow_zero=True)
+        async with self._refresh_lock:
+            now = time.monotonic()
+            if self._last_refresh is not None and now - self._last_refresh < interval:
+                return
+            try:
+                outcome = await asyncio.to_thread(_refresh_clone_sync, self._root)
+            except Exception:
+                # _refresh_clone_sync is already non-raising; this is the last
+                # guard that a refresh problem can never fail a search.
+                logger.exception("Pre-search refresh of %s failed", self._root)
+            else:
+                logger.info("Pre-search refresh of %s: %s", self._root, outcome)
+            self._last_refresh = time.monotonic()
 
     # -- semantic overlay path -----------------------------------------------
 
@@ -401,6 +478,29 @@ class BranchOverlayManager:
             logger.info("Evicted %d stale branch overlay(s): %s", len(stale), ", ".join(stale))
 
 
+def _refresh_clone_sync(root: Path) -> str:
+    """Pull (or fetch) *root*; return a one-line outcome for the log. Never raises.
+
+    Which one depends on ``COCOINDEX_CODE_GIT_PULL_ENABLED``, the same gate the
+    daily maintenance workflow uses:
+
+    * **on** — a full pull (``fetch --prune`` + ``reset --hard @{u}``), so the
+      base ref and working tree advance and the diff base is current. This
+      rewrites the working tree, which is why it stays behind the operator's
+      opt-in; note the base *index* only catches up on the next index pass, so a
+      refresh here widens the staleness window documented in
+      ``docs/branch-search.md``.
+    * **off** — ``fetch --prune`` only. Every remote branch and its newest
+      commits become searchable with no working-tree impact; the diff base stays
+      wherever the last real pull left it.
+    """
+    if not git_pull_enabled():
+        error = git_ops.fetch_all(root, credentials=git_ops.load_credentials())
+        return f"fetch failed: {error}" if error else "fetched"
+    result = git_hard_reset_sync(root, git_ops.load_credentials())
+    return f"{result.status}: {result.message}"
+
+
 def _unresolved_message(branch_ref: str) -> str:
     """Why *branch_ref* couldn't be resolved — the fix differs by fetch setting."""
     if git_ops.fetch_enabled():
@@ -444,6 +544,8 @@ def _rows_to_arrow(rows: list[dict[str, Any]], dim: int) -> Any:
             "content": pa.array([r["content"] for r in rows], pa.string()),
             "start_line": pa.array([r["start_line"] for r in rows], pa.int64()),
             "end_line": pa.array([r["end_line"] for r in rows], pa.int64()),
-            "embedding": pa.array([r["embedding"].tolist() for r in rows], pa.list_(pa.float32(), dim)),
+            "embedding": pa.array(
+                [r["embedding"].tolist() for r in rows], pa.list_(pa.float32(), dim)
+            ),
         }
     )

@@ -66,6 +66,9 @@ from .protocol import (
     RemoveProjectResponse,
     Request,
     Response,
+    RipgrepMatch,
+    RipgrepRequest,
+    RipgrepResponse,
     SearchRequest,
     SearchResponse,
     SearchStreamResponse,
@@ -365,6 +368,41 @@ async def _run_search(project: Project, req: SearchRequest) -> SearchResponse:
         total_returned=len(results),
         offset=req.offset,
     )
+
+
+async def _run_ripgrep(project: Project, req: RipgrepRequest) -> RipgrepResponse:
+    """Execute a ripgrep request. No index involved, so nothing is waited on."""
+    outcome = await project.ripgrep(
+        req.pattern,
+        limit=req.limit,
+        globs=req.globs,
+        case_sensitive=req.case_sensitive,
+        fixed_strings=req.fixed_strings,
+        context_lines=req.context_lines,
+        branch=req.branch,
+    )
+    matches = [
+        RipgrepMatch(
+            file_path=m.file_path,
+            line_number=m.line_number,
+            content=m.content,
+            start_line=m.start_line,
+            end_line=m.end_line,
+        )
+        for m in outcome.matches
+    ]
+    return RipgrepResponse(
+        success=True,
+        matches=matches,
+        total_returned=len(matches),
+        truncated=outcome.truncated,
+    )
+
+
+async def ripgrep_project(registry: ProjectRegistry, req: RipgrepRequest) -> RipgrepResponse:
+    """Resolve a ripgrep request end-to-end for the in-process MCP server."""
+    project = await registry.get_project(req.project_root)
+    return await _run_ripgrep(project, req)
 
 
 async def _search_with_wait(
@@ -700,6 +738,13 @@ async def _dispatch(
 
             return await _run_search(project, req)
 
+        if isinstance(req, RipgrepRequest):
+            # No ensure_indexing_started(): ripgrep reads the tree directly, so
+            # it works before (and without) an index, and a grep must never kick
+            # off a full index pass.
+            project = await registry.get_project(req.project_root)
+            return await _run_ripgrep(project, req)
+
         if isinstance(req, ProjectStatusRequest):
             project = await registry.get_project(req.project_root)
             await project.ensure_indexing_started()
@@ -896,9 +941,34 @@ def _start_mcp_http_server(
             ),
         )
 
+    async def _rg_backend(
+        *,
+        pattern: str,
+        limit: int,
+        globs: list[str] | None,
+        case_sensitive: bool,
+        fixed_strings: bool,
+        context_lines: int,
+        branch: str | None,
+    ) -> RipgrepResponse:
+        return await ripgrep_project(
+            registry,
+            RipgrepRequest(
+                project_root=project_root,
+                pattern=pattern,
+                limit=limit,
+                globs=globs,
+                case_sensitive=case_sensitive,
+                fixed_strings=fixed_strings,
+                context_lines=context_lines,
+                branch=branch,
+            ),
+        )
+
     mcp = create_mcp_server(
         project_root,
         search_backend=_backend,
+        ripgrep_backend=_rg_backend,
         transport_security=_mcp_transport_security(),
     )
     config = uvicorn.Config(

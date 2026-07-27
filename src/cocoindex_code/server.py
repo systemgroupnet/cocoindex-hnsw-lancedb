@@ -22,13 +22,16 @@ from pydantic import BaseModel, Field
 if TYPE_CHECKING:
     from mcp.server.transport_security import TransportSecuritySettings
 
-    from .protocol import SearchResponse
+    from .protocol import RipgrepResponse, SearchResponse
 
 # Resolves a search query to a SearchResponse. The stdio server (`ccc mcp`)
 # uses a backend that round-trips through the daemon over the client socket;
 # the in-daemon HTTP server passes one that queries the project registry
 # in-process. Keyword-only args mirror the `search` tool's parameters.
 SearchBackend = Callable[..., Awaitable["SearchResponse"]]
+
+# Same split for the `ripgrep` tool: socket round-trip vs. in-process registry.
+RipgrepBackend = Callable[..., Awaitable["RipgrepResponse"]]
 
 _MCP_INSTRUCTIONS = (
     "Code search and codebase understanding tools."
@@ -38,7 +41,8 @@ _MCP_INSTRUCTIONS = (
     "\n"
     "Provides semantic search that understands meaning --"
     " unlike grep or text matching,"
-    " it finds relevant code even when exact keywords are unknown."
+    " it finds relevant code even when exact keywords are unknown --"
+    " plus a ripgrep tool for exact text and regex matches."
 )
 
 
@@ -70,6 +74,33 @@ class SearchResultModel(BaseModel):
     results: list[CodeChunkResult] = Field(default_factory=list)
     total_returned: int = Field(default=0)
     offset: int = Field(default=0)
+    message: str | None = None
+
+
+class RipgrepMatchResult(BaseModel):
+    """A single ripgrep match."""
+
+    file_path: str = Field(description="Relative path to the file")
+    line_number: int = Field(description="Line number of the match (1-indexed)")
+    content: str = Field(
+        description=(
+            "The matching line, or the surrounding lines when context_lines was set"
+        )
+    )
+    start_line: int = Field(description="First line of 'content' (1-indexed)")
+    end_line: int = Field(description="Last line of 'content' (1-indexed)")
+
+
+class RipgrepResultModel(BaseModel):
+    """Result from the ripgrep tool."""
+
+    success: bool
+    matches: list[RipgrepMatchResult] = Field(default_factory=list)
+    total_returned: int = Field(default=0)
+    truncated: bool = Field(
+        default=False,
+        description="True when more matches exist than were returned (limit reached)",
+    )
     message: str | None = None
 
 
@@ -114,16 +145,51 @@ def _make_client_search_backend(project_root: str) -> SearchBackend:
     return backend
 
 
+def _make_client_ripgrep_backend(project_root: str) -> RipgrepBackend:
+    """Ripgrep backend that round-trips through the daemon over the client socket."""
+
+    async def backend(
+        *,
+        pattern: str,
+        limit: int,
+        globs: list[str] | None,
+        case_sensitive: bool,
+        fixed_strings: bool,
+        context_lines: int,
+        branch: str | None,
+    ) -> RipgrepResponse:
+        from . import client as _client
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: _client.ripgrep(
+                project_root=project_root,
+                pattern=pattern,
+                limit=limit,
+                globs=globs,
+                case_sensitive=case_sensitive,
+                fixed_strings=fixed_strings,
+                context_lines=context_lines,
+                branch=branch,
+            ),
+        )
+
+    return backend
+
+
 def create_mcp_server(
     project_root: str,
     search_backend: SearchBackend | None = None,
+    ripgrep_backend: RipgrepBackend | None = None,
     transport_security: TransportSecuritySettings | None = None,
 ) -> FastMCP:
-    """Create an MCP server exposing the codebase ``search`` tool.
+    """Create an MCP server exposing the ``search`` and ``ripgrep`` tools.
 
-    *search_backend* resolves each query to a ``SearchResponse``. It defaults to
-    a daemon-client backend (socket round-trip) for the stdio server; the daemon
-    passes a backend that queries its in-process project registry directly.
+    *search_backend* resolves each query to a ``SearchResponse``, and
+    *ripgrep_backend* each pattern to a ``RipgrepResponse``. Both default to
+    daemon-client backends (socket round-trip) for the stdio server; the daemon
+    passes backends that query its in-process project registry directly.
 
     *transport_security* configures the streamable-HTTP transport's DNS-rebinding
     protection (Host/Origin validation). When ``None``, FastMCP applies its
@@ -133,6 +199,7 @@ def create_mcp_server(
     proxied request gets ``421 Invalid Host header``.
     """
     backend = search_backend or _make_client_search_backend(project_root)
+    rg_backend = ripgrep_backend or _make_client_ripgrep_backend(project_root)
     mcp = FastMCP(
         "cocoindex-code",
         instructions=_MCP_INSTRUCTIONS,
@@ -246,6 +313,104 @@ def create_mcp_server(
             )
         except Exception as e:
             return SearchResultModel(success=False, message=f"Query failed: {e!s}")
+
+    @mcp.tool(
+        name="ripgrep",
+        description=(
+            "Exact text and regex search across the codebase, powered by ripgrep."
+            " Use this when you know the literal string you're looking for --"
+            " a function or symbol name, an error message, a config key,"
+            " a TODO marker -- and want every occurrence with file and line numbers."
+            " Use the 'search' tool instead when you're looking for code by meaning"
+            " and don't know the exact text."
+            " Reads the working tree directly, so it needs no index"
+            " and also finds matches in files the index skips."
+        ),
+    )
+    async def ripgrep(
+        pattern: str = Field(
+            description=(
+                "Rust-regex pattern to search for (set fixed_strings for a literal"
+                " string). Examples: 'def create_mcp_server', 'TODO\\(\\w+\\)',"
+                " 'COCOINDEX_CODE_[A-Z_]+'."
+            )
+        ),
+        limit: int = Field(
+            default=50,
+            ge=1,
+            le=1000,
+            description=(
+                "Maximum matches to return (1-1000). Check 'truncated' in the"
+                " response to see whether more exist."
+            ),
+        ),
+        globs: list[str] | None = Field(
+            default=None,
+            description=(
+                "Ripgrep glob filters. Prefix with '!' to exclude."
+                " Example: ['src/**/*.py', '!**/tests/**']"
+            ),
+        ),
+        case_sensitive: bool = Field(
+            default=False,
+            description="Match case-sensitively. Defaults to case-insensitive.",
+        ),
+        fixed_strings: bool = Field(
+            default=False,
+            description=(
+                "Treat the pattern as a literal string instead of a regex."
+                " Use for text with regex metacharacters, e.g. 'foo(bar)[0]'."
+            ),
+        ),
+        context_lines: int = Field(
+            default=0,
+            ge=0,
+            le=20,
+            description=(
+                "Lines of surrounding context to include on each side of a match"
+                " (0-20). 0 returns just the matching line."
+            ),
+        ),
+        branch: str | None = Field(
+            default=None,
+            description=(
+                "Git branch (or ref/SHA) to search. Omit to search the checked-out"
+                " base branch (the default). Any other ref searches that branch's"
+                " view of the tree: the base minus the files the branch touched,"
+                " plus the branch's own version of the files it added or modified."
+                " The ref is fetched on demand if it isn't in the server's clone."
+            ),
+        ),
+    ) -> RipgrepResultModel:
+        """Run a ripgrep scan via the configured backend."""
+        try:
+            resp = await rg_backend(
+                pattern=pattern,
+                limit=limit,
+                globs=globs,
+                case_sensitive=case_sensitive,
+                fixed_strings=fixed_strings,
+                context_lines=context_lines,
+                branch=branch,
+            )
+            return RipgrepResultModel(
+                success=resp.success,
+                matches=[
+                    RipgrepMatchResult(
+                        file_path=m.file_path,
+                        line_number=m.line_number,
+                        content=m.content,
+                        start_line=m.start_line,
+                        end_line=m.end_line,
+                    )
+                    for m in resp.matches
+                ],
+                total_returned=resp.total_returned,
+                truncated=resp.truncated,
+                message=resp.message,
+            )
+        except Exception as e:
+            return RipgrepResultModel(success=False, message=f"Ripgrep failed: {e!s}")
 
     return mcp
 

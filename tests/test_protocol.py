@@ -26,6 +26,9 @@ from cocoindex_code.protocol import (
     RemoveProjectResponse,
     Request,
     Response,
+    RipgrepMatch,
+    RipgrepRequest,
+    RipgrepResponse,
     SearchRequest,
     SearchResponse,
     SearchResult,
@@ -74,6 +77,50 @@ def test_encode_decode_search_request_with_all_fields() -> None:
     assert decoded.paths == ["src/*"]
     assert decoded.limit == 20
     assert decoded.offset == 5
+
+
+def test_encode_decode_ripgrep_request_with_all_fields() -> None:
+    req = RipgrepRequest(
+        project_root="/tmp/proj",
+        pattern="TODO",
+        limit=25,
+        globs=["src/**", "!**/tests/**"],
+        case_sensitive=True,
+        fixed_strings=True,
+        context_lines=3,
+        branch="feature/x",
+    )
+    decoded = decode_request(encode_request(req))
+    assert isinstance(decoded, RipgrepRequest)
+    assert decoded.pattern == "TODO"
+    assert decoded.limit == 25
+    assert decoded.globs == ["src/**", "!**/tests/**"]
+    assert decoded.case_sensitive is True
+    assert decoded.fixed_strings is True
+    assert decoded.context_lines == 3
+    assert decoded.branch == "feature/x"
+
+
+def test_encode_decode_ripgrep_response_with_matches() -> None:
+    resp = RipgrepResponse(
+        success=True,
+        matches=[
+            RipgrepMatch(
+                file_path="src/a.py",
+                line_number=12,
+                content="# TODO: fix",
+                start_line=12,
+                end_line=12,
+            )
+        ],
+        total_returned=1,
+        truncated=True,
+    )
+    decoded = decode_response(encode_response(resp))
+    assert isinstance(decoded, RipgrepResponse)
+    assert decoded.matches[0].file_path == "src/a.py"
+    assert decoded.matches[0].line_number == 12
+    assert decoded.truncated is True
 
 
 def test_encode_decode_search_response_with_results() -> None:
@@ -198,6 +245,7 @@ def test_all_request_types_round_trip() -> None:
         HandshakeRequest(version="1.0.0"),
         IndexRequest(project_root="/tmp"),
         SearchRequest(project_root="/tmp", query="test"),
+        RipgrepRequest(project_root="/tmp", pattern="test"),
         ProjectStatusRequest(project_root="/tmp"),
         DaemonStatusRequest(),
         RemoveProjectRequest(project_root="/tmp"),

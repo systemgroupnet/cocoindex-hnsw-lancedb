@@ -34,6 +34,23 @@ class SearchRequest(_msgspec.Struct, tag="search"):
     refresh: bool = True
 
 
+class RipgrepRequest(_msgspec.Struct, tag="ripgrep"):
+    """Literal text/regex search via the ``rg`` binary — no index involved."""
+
+    project_root: str
+    pattern: str
+    limit: int = 50
+    # Glob filters passed to rg (``src/**``, ``!**/*_test.go``, ...).
+    globs: list[str] | None = None
+    case_sensitive: bool = False
+    fixed_strings: bool = False
+    context_lines: int = 0
+    # Git branch/ref to search, same semantics as SearchRequest.branch: the base
+    # working tree minus the files the branch touched, plus the branch's version
+    # of the files it added or modified.
+    branch: str | None = None
+
+
 class ProjectStatusRequest(_msgspec.Struct, tag="project_status"):
     project_root: str
 
@@ -80,6 +97,7 @@ Request = (
     HandshakeRequest
     | IndexRequest
     | SearchRequest
+    | RipgrepRequest
     | ProjectStatusRequest
     | DaemonStatusRequest
     | RemoveProjectRequest
@@ -151,6 +169,26 @@ class SearchResponse(_msgspec.Struct, tag="search"):
     results: list[SearchResult] = []
     total_returned: int = 0
     offset: int = 0
+    message: str | None = None
+
+
+class RipgrepMatch(_msgspec.Struct):
+    """One matching line. ``content`` widens to the context window when asked."""
+
+    file_path: str
+    line_number: int
+    content: str
+    start_line: int
+    end_line: int
+
+
+class RipgrepResponse(_msgspec.Struct, tag="ripgrep"):
+    success: bool
+    matches: list[RipgrepMatch] = []
+    total_returned: int = 0
+    # True when the limit or the rg timeout cut the scan short — there are more
+    # matches than these.
+    truncated: bool = False
     message: str | None = None
 
 
@@ -251,6 +289,7 @@ Response = (
     | IndexProgressUpdate
     | IndexWaitingNotice
     | SearchResponse
+    | RipgrepResponse
     | ProjectStatusResponse
     | DaemonStatusResponse
     | RemoveProjectResponse

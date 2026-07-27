@@ -12,8 +12,8 @@ from typing import Any
 import cocoindex as coco
 from cocoindex.connectors import lancedb as coco_lancedb
 
-from . import git_ops
-from .branch_overlay import BranchOverlayManager
+from . import git_ops, ripgrep
+from .branch_overlay import BranchOverlayManager, BranchView
 from .chunking import CHUNKER_REGISTRY, ChunkerFn
 from .indexer import indexer_main
 from . import metrics
@@ -422,6 +422,71 @@ class Project:
             )
             for r in results
         ]
+
+    async def ripgrep(
+        self,
+        pattern: str,
+        *,
+        limit: int = 50,
+        globs: list[str] | None = None,
+        case_sensitive: bool = False,
+        fixed_strings: bool = False,
+        context_lines: int = 0,
+        branch: str | None = None,
+    ) -> ripgrep.RipgrepOutcome:
+        """Literal/regex search of the codebase via ``rg``. Does not touch the index.
+
+        With *branch* set (and different from the base ref), searches that ref's
+        view of the tree — the base minus the files it touched, plus its own
+        version of what it added or modified — reusing the same branch
+        resolution the semantic branch search uses.
+
+        Raises ``RuntimeError`` if ``rg`` isn't installed or the branch can't be
+        resolved.
+        """
+        query = ripgrep.RipgrepQuery(
+            patterns=(pattern,),
+            limit=limit,
+            globs=tuple(globs or ()),
+            case_sensitive=case_sensitive,
+            fixed_strings=fixed_strings,
+            context_lines=context_lines,
+        )
+
+        branch = branch.strip() if branch else None
+        view: BranchView | None = None
+        if branch:
+            base_ref = git_ops.detect_base_ref(self._project_root)
+            if base_ref is None:
+                raise RuntimeError(
+                    "could not determine the base ref for branch search "
+                    "(not a git repo or detached HEAD; set COCOINDEX_CODE_BASE_REF)"
+                )
+            if branch != base_ref:
+                view = await self._overlays.resolve_branch(
+                    base_ref=base_ref, branch_ref=branch
+                )
+
+        # rg and the blob reads are blocking, so the whole scan runs off the loop.
+        if view is None:
+            outcome = await asyncio.to_thread(
+                ripgrep.search_tree, self._project_root, query
+            )
+        else:
+            outcome = await asyncio.to_thread(
+                ripgrep.search_branch,
+                self._project_root,
+                query,
+                branch_sha=view.sha,
+                branch_paths=view.branch_paths,
+                shadow_paths=view.shadow_paths,
+            )
+        if outcome is None:
+            raise RuntimeError(
+                "ripgrep (rg) is not available on the server — install it "
+                "(e.g. `apt-get install ripgrep`) to use this tool"
+            )
+        return outcome
 
     async def evict_stale_overlays(self) -> None:
         """Drop branch overlays past their TTL (delegates to the overlay manager)."""

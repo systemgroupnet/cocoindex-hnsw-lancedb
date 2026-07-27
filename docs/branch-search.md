@@ -35,6 +35,8 @@ by construction.
 > A file changed on the base *after* its last index pass but *not* on the branch
 > can therefore be missed by the shadow set. Tolerable for review; a future
 > refinement pins the diff base to the indexed commit SHA (see Future work).
+> The [pre-search refresh](#pre-search-refresh) widens this window when the pull
+> gate is on, since it advances the base ref without re-indexing.
 
 ### What "search branch X" means
 
@@ -74,6 +76,34 @@ Overlay rows are embedded with the **indexing** embedder and
 overlay build can briefly serialize behind an in-flight index pass on the
 indexing embedder's lock. Overlays are cached, so this is a one-time cost per
 branch commit.)
+
+## Pre-search refresh
+
+A branch is usually searched moments after it is pushed, so serving whatever the
+last scheduled pull left behind is routinely stale. Every branch search therefore
+refreshes the clone first. It is best-effort: any failure is logged and the
+search continues against whatever the clone already has.
+
+What "refresh" means follows `COCOINDEX_CODE_GIT_PULL_ENABLED`, the same gate the
+daily maintenance workflow uses — a pre-search refresh must not quietly turn on
+the destructive step an operator deliberately left off:
+
+| Gate | Action | Effect |
+| --- | --- | --- |
+| **on** | `git fetch --prune` + `git reset --hard @{u}` | Base ref and working tree advance, so the diff base is current. |
+| **off** (default) | `git fetch --prune` | Every remote branch and its newest commits become searchable; HEAD, index, and working tree untouched. |
+
+With the gate **on**, note the interaction with the staleness window above: the
+refresh advances the base ref but the base *index* only catches up on the next
+index pass, so the gap between them widens. It also rewrites the working tree,
+which can shift under a concurrent index pass — the same exposure the scheduled
+pull already carries, now reachable from the query path.
+
+Refreshes are throttled to one per `COCOINDEX_CODE_BRANCH_REFRESH_SECONDS`
+(default 60; `0` refreshes on every search). Agents fire searches in bursts, and
+a round-trip per search buys nothing. The throttle timestamp is stamped on
+failure too, so an unreachable remote costs one timeout per interval rather than
+one per search.
 
 ## Ref resolution
 
@@ -130,7 +160,7 @@ A branch's divergence from the base decides the path, gated by
 2. `git diff --name-status <merge-base>..X` → added/modified/deleted sets,
    filtered by the same include/exclude/gitignore matchers the base indexer uses.
 3. Build (or reuse) `overlay_<sha>`: read each added/modified file via
-   `git show X:<path>`, chunk it (shared `chunk_file_content`), embed, write.
+   `git show <sha>:<path>`, chunk it (shared `chunk_file_content`), embed, write.
 4. Query = two vector searches merged by cosine score:
    - `overlay_<sha>` — unfiltered.
    - `code_chunks` — `WHERE file_path NOT IN (<shadow set>)`.
@@ -164,6 +194,12 @@ Each result gains a `source` field (`"semantic"` | `"lexical"`, default
 `"semantic"`) so existing clients keep working and branch-aware clients can
 render the two sections.
 
+The `ripgrep` tool takes the same `branch` parameter and resolves it through the
+same path (`BranchOverlayManager.resolve_branch`: refresh → resolve → diff →
+filter), then applies the same decomposition to a text scan — the base working
+tree minus the shadow set, plus rg over the branch's version of the files it
+changed. No overlay table is involved, and no index is needed.
+
 ## Eviction
 
 Overlays are disk. Each is dropped when it hasn't been *searched* within
@@ -179,7 +215,9 @@ in the daily maintenance workflow. Eviction is a `drop_table` + sidecar prune.
 | `COCOINDEX_CODE_BRANCH_MAX_CHANGED_FILES` | `50` | Above this, use the lexical fallback instead of a semantic overlay. |
 | `COCOINDEX_CODE_BRANCH_OVERLAY_TTL_DAYS` | `7` | Evict an overlay not searched within this many days. |
 | `COCOINDEX_CODE_BRANCH_FETCH_ENABLED` | on | Set falsy to forbid the on-demand fetch, restricting search to refs already in the clone. |
-| `COCOINDEX_CODE_GIT_USERNAME` / `COCOINDEX_CODE_GIT_PASSWORD` | unset | HTTPS credentials for the on-demand fetch (shared with the scheduled pull). |
+| `COCOINDEX_CODE_BRANCH_REFRESH_SECONDS` | `60` | Minimum seconds between pre-search refreshes; `0` refreshes on every search. |
+| `COCOINDEX_CODE_GIT_PULL_ENABLED` | off | When on, the pre-search refresh is a full pull (`reset --hard`) instead of a fetch. |
+| `COCOINDEX_CODE_GIT_USERNAME` / `COCOINDEX_CODE_GIT_PASSWORD` | unset | HTTPS credentials for the pre-search refresh and the on-demand fetch (shared with the scheduled pull). |
 
 ## Future work (deferred, tracked)
 

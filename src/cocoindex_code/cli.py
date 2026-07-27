@@ -16,6 +16,7 @@ if TYPE_CHECKING:
         DoctorCheckResult,
         IndexingProgress,
         ProjectStatusResponse,
+        RipgrepResponse,
         SearchResponse,
     )
 
@@ -182,6 +183,37 @@ def print_search_results(response: SearchResponse) -> None:
         _typer.echo(f"\n--- Result {i} (score: {r.score:.3f}){tag} ---")
         _typer.echo(f"File: {r.file_path}:{r.start_line}-{r.end_line} [{r.language}]")
         _typer.echo(r.content)
+
+
+def print_grep_results(response: RipgrepResponse) -> None:
+    """Print ripgrep matches in the familiar ``file:line: text`` form."""
+    if not response.success:
+        _typer.echo(f"Grep failed: {response.message}", err=True)
+        return
+
+    if not response.matches:
+        _typer.echo("No matches found.")
+        return
+
+    for m in response.matches:
+        if m.start_line == m.end_line:
+            _typer.echo(f"{m.file_path}:{m.line_number}: {m.content}")
+            continue
+        # With context, the match spans lines — print each with its own number so
+        # the matching line is still identifiable.
+        _typer.echo(f"\n--- {m.file_path}:{m.line_number} ---")
+        for offset, line in enumerate(m.content.splitlines()):
+            lineno = m.start_line + offset
+            marker = ">" if lineno == m.line_number else " "
+            _typer.echo(f"{marker} {lineno}: {line}")
+
+    if response.truncated:
+        # ASCII only: this lands on a Windows console under cp1252, where an
+        # em dash renders as a replacement character.
+        _typer.echo(
+            f"\n(stopped at {response.total_returned} matches; more exist - raise --limit)",
+            err=True,
+        )
 
 
 def _run_index_with_progress(project_root: str) -> None:
@@ -691,6 +723,54 @@ def search(
         branch=branch,
     )
     print_search_results(resp)
+
+
+@app.command()
+@_catch_daemon_start_error
+def grep(
+    pattern: str = _typer.Argument(..., help="Regex to search for (see --fixed for a literal)"),
+    glob: list[str] = _typer.Option(
+        [], "--glob", "-g", help="Filter by glob; prefix with '!' to exclude. Repeatable."
+    ),
+    limit: int = _typer.Option(50, "--limit", help="Maximum matches to return"),
+    case_sensitive: bool = _typer.Option(
+        False, "--case-sensitive", "-s", help="Match case-sensitively (default: insensitive)"
+    ),
+    fixed: bool = _typer.Option(
+        False, "--fixed", "-F", help="Treat the pattern as a literal string, not a regex"
+    ),
+    context: int = _typer.Option(
+        0, "--context", "-C", min=0, max=20, help="Lines of context around each match"
+    ),
+    branch: str | None = _typer.Option(
+        None, "--branch", help="Git branch/ref to search (default: the checked-out base branch)"
+    ),
+) -> None:
+    """Exact text/regex search across the codebase, via ripgrep.
+
+    Reads the working tree directly, so it needs no index. Use `ccc search` to
+    find code by meaning instead of exact text.
+    """
+    from . import client as _client
+
+    project_root = str(require_project_root())
+    try:
+        resp = _client.ripgrep(
+            project_root,
+            pattern,
+            limit=limit,
+            globs=glob or None,
+            case_sensitive=case_sensitive,
+            fixed_strings=fixed,
+            context_lines=context,
+            branch=branch,
+        )
+    except RuntimeError as e:
+        # A missing `rg`, an unresolvable branch, or any other daemon-side error:
+        # actionable one-liner and exit 1, not a traceback.
+        _typer.echo(f"Grep failed: {e}", err=True)
+        raise _typer.Exit(code=1)
+    print_grep_results(resp)
 
 
 @app.command()

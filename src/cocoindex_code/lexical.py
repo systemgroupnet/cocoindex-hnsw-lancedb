@@ -5,23 +5,20 @@ files to embed into a semantic overlay, its changed files are searched
 lexically instead and returned as a separate ``source="lexical"`` section.
 
 Prefers the ``rg`` (ripgrep) binary to locate candidate lines when it is on
-``PATH``; otherwise falls back to an equivalent in-process Python scan. Scoring
-and snippet extraction always run in Python over the content held in memory, so
-the two paths return identical results — ripgrep is only a candidate-finding
-accelerator, never a source of truth.
+``PATH`` (via :mod:`cocoindex_code.ripgrep`); otherwise falls back to an
+equivalent in-process Python scan. Scoring and snippet extraction always run in
+Python over the content held in memory, so the two paths return identical
+results — ripgrep is only a candidate-finding accelerator, never a source of
+truth.
 """
 
 from __future__ import annotations
 
-import json
-import os
 import re
-import shutil
-import subprocess
-import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
-from pathlib import Path
+
+from . import ripgrep
 
 # Query tokenization: alphanumeric/underscore runs, lowercased. Very short and
 # ultra-common tokens carry no signal for code search and would match nearly
@@ -39,7 +36,6 @@ _STOPWORDS = frozenset(
 
 # Lines around a match returned as context in the snippet.
 _CONTEXT_LINES = 2
-_RG_TIMEOUT_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -149,57 +145,18 @@ def _rg_candidate_lines(
 ) -> dict[str, set[int]] | None:
     """Find candidate lines with ripgrep, or ``None`` if rg is unusable.
 
-    Writes each file's content to a temp tree and runs a single case-insensitive
-    fixed-string ``rg --json`` pass. Returns ``None`` (so the caller falls back
-    to Python) when rg is absent or errors; an empty dict means rg ran and found
-    nothing.
+    One case-insensitive fixed-string pass over the files' content. No limit:
+    scoring below ranks the full candidate set, so truncating here would change
+    which hits win. ``None`` (rg absent or unrunnable) sends the caller to the
+    Python scan; an empty dict means rg ran and found nothing.
     """
-    if shutil.which("rg") is None:
+    outcome = ripgrep.search_blobs(
+        {f.path: f.content for f in files},
+        ripgrep.RipgrepQuery(patterns=tuple(terms), fixed_strings=True),
+    )
+    if outcome is None:
         return None
-
-    try:
-        with tempfile.TemporaryDirectory(prefix="ccc-lexical-") as tmp:
-            tmp_root = Path(tmp)
-            rel_by_abs: dict[str, str] = {}
-            for lf in files:
-                # git paths are repo-relative and never contain ".."; guard anyway
-                # so a crafted path can't escape the temp tree.
-                dest = (tmp_root / lf.path).resolve()
-                if not str(dest).startswith(str(tmp_root.resolve())):
-                    continue
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_text(lf.content, encoding="utf-8")
-                rel_by_abs[str(dest)] = lf.path
-
-            args = ["rg", "--json", "--ignore-case", "--fixed-strings"]
-            for term in terms:
-                args += ["-e", term]
-            args.append(str(tmp_root))
-
-            proc = subprocess.run(
-                args, capture_output=True, text=True, timeout=_RG_TIMEOUT_SECONDS, check=False
-            )
-            # 0 = matches, 1 = no matches (both fine); >=2 = real error -> fallback.
-            if proc.returncode >= 2:
-                return None
-
-            result: dict[str, set[int]] = {}
-            for raw in proc.stdout.splitlines():
-                if not raw:
-                    continue
-                try:
-                    event = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") != "match":
-                    continue
-                data = event["data"]
-                abs_path = data.get("path", {}).get("text")
-                lineno = data.get("line_number")
-                rel = rel_by_abs.get(os.path.abspath(abs_path)) if abs_path else None
-                if rel is None or lineno is None:
-                    continue
-                result.setdefault(rel, set()).add(int(lineno))
-            return result
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+    result: dict[str, set[int]] = {}
+    for match in outcome.matches:
+        result.setdefault(match.file_path, set()).add(match.line_number)
+    return result

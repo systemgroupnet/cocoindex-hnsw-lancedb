@@ -5,14 +5,101 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 from cocoindex_code import cli
 from cocoindex_code.cli import (
     add_to_gitignore,
+    app,
+    print_grep_results,
     remove_from_gitignore,
     require_project_root,
     resolve_default_path,
 )
+from cocoindex_code.protocol import RipgrepMatch, RipgrepResponse
+
+# --- `ccc grep` output -------------------------------------------------------
+
+
+def _match(**kwargs: object) -> RipgrepMatch:
+    defaults: dict[str, object] = {
+        "file_path": "src/a.py",
+        "line_number": 12,
+        "content": "# TODO: fix",
+        "start_line": 12,
+        "end_line": 12,
+    }
+    return RipgrepMatch(**{**defaults, **kwargs})
+
+
+def test_print_grep_results_uses_file_line_text_form(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    print_grep_results(RipgrepResponse(success=True, matches=[_match()], total_returned=1))
+    assert capsys.readouterr().out == "src/a.py:12: # TODO: fix\n"
+
+
+def test_print_grep_results_numbers_each_context_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With context the match spans lines, so each gets its number and the hit a marker."""
+    match = _match(content="before\n# TODO: fix\nafter", start_line=11, end_line=13)
+    print_grep_results(RipgrepResponse(success=True, matches=[match], total_returned=1))
+    out = capsys.readouterr().out
+    assert "--- src/a.py:12 ---" in out
+    assert "  11: before" in out
+    assert "> 12: # TODO: fix" in out
+    assert "  13: after" in out
+
+
+def test_print_grep_results_flags_truncation(capsys: pytest.CaptureFixture[str]) -> None:
+    print_grep_results(
+        RipgrepResponse(success=True, matches=[_match()], total_returned=1, truncated=True)
+    )
+    captured = capsys.readouterr()
+    assert "src/a.py:12:" in captured.out
+    # The "there are more" note is advisory, so it goes to stderr and never
+    # pollutes piped output.
+    assert "more exist" in captured.err
+
+
+def test_print_grep_results_reports_no_matches_and_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    print_grep_results(RipgrepResponse(success=True))
+    assert "No matches found." in capsys.readouterr().out
+
+    print_grep_results(RipgrepResponse(success=False, message="rg is not installed"))
+    assert "Grep failed: rg is not installed" in capsys.readouterr().err
+
+
+def test_grep_command_reports_daemon_error_without_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing `rg` (or any daemon error) is a one-line message and exit 1."""
+    project = tmp_path / "project"
+    (project / ".cocoindex_code").mkdir(parents=True)
+    (project / ".cocoindex_code" / "settings.yml").write_text("include_patterns: []")
+    settings_dir = tmp_path / "ccc_home"
+    settings_dir.mkdir()
+    (settings_dir / "global_settings.yml").write_text(
+        "embedding:\n  model: test\n  provider: litellm\n"
+    )
+    monkeypatch.setenv("COCOINDEX_CODE_DIR", str(settings_dir))
+    monkeypatch.chdir(project)
+
+    from cocoindex_code import client as _client
+
+    def _boom(*args: object, **kwargs: object) -> RipgrepResponse:
+        raise RuntimeError("Daemon error: ripgrep (rg) is not available on the server")
+
+    monkeypatch.setattr(_client, "ripgrep", _boom)
+
+    result = CliRunner().invoke(app, ["grep", "TODO"])
+    assert result.exit_code == 1
+    assert "Grep failed: " in result.output
+    assert "not available on the server" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_require_project_root_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -144,6 +144,17 @@ def _parse_workspaces(raw: str | None) -> tuple[Path, ...]:
     return tuple(roots)
 
 
+def git_pull_enabled() -> bool:
+    """Whether the destructive git-pull step (fetch + ``reset --hard``) is allowed.
+
+    Off unless explicitly enabled: the step discards local changes to tracked
+    files. Read here rather than off :class:`ScheduleConfig` by callers outside
+    the scheduled workflow — branch search consults it before refreshing a clone.
+    """
+    raw = os.environ.get(ENV_GIT_PULL_ENABLED)
+    return raw is not None and _is_truthy(raw)
+
+
 def load_config() -> ScheduleConfig:
     """Build a :class:`ScheduleConfig` from the environment.
 
@@ -153,14 +164,11 @@ def load_config() -> ScheduleConfig:
     enabled_raw = os.environ.get(ENV_ENABLED)
     enabled = not (enabled_raw is not None and _is_falsy(enabled_raw))
 
-    git_raw = os.environ.get(ENV_GIT_PULL_ENABLED)
-    git_pull_enabled = git_raw is not None and _is_truthy(git_raw)
-
     return ScheduleConfig(
         enabled=enabled,
         run_time=_parse_time(os.environ.get(ENV_TIME)),
         workspaces=_parse_workspaces(os.environ.get(ENV_WORKSPACES)),
-        git_pull_enabled=git_pull_enabled,
+        git_pull_enabled=git_pull_enabled(),
         git_credentials=load_credentials(),
     )
 

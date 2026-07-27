@@ -52,6 +52,8 @@ from .protocol import (
     RemoveProjectResponse,
     Request,
     Response,
+    RipgrepRequest,
+    RipgrepResponse,
     SearchRequest,
     SearchResponse,
     StopRequest,
@@ -386,6 +388,36 @@ def compact(project_root: str) -> CompactResponse:
 def push_metrics(project_root: str) -> PushMetricsResponse:
     """Push the current stats snapshot to the configured MySQL target on demand."""
     return _send(PushMetricsRequest(project_root=normalize_input_path(project_root)))  # type: ignore[return-value]
+
+
+def ripgrep(
+    project_root: str,
+    pattern: str,
+    *,
+    limit: int = 50,
+    globs: list[str] | None = None,
+    case_sensitive: bool = False,
+    fixed_strings: bool = False,
+    context_lines: int = 0,
+    branch: str | None = None,
+) -> RipgrepResponse:
+    """Search the codebase (or a branch's view of it) with ripgrep.
+
+    Reads the working tree directly, so it needs no index and never triggers
+    one.
+    """
+    return _send(  # type: ignore[return-value]
+        RipgrepRequest(
+            project_root=normalize_input_path(project_root),
+            pattern=pattern,
+            limit=limit,
+            globs=globs,
+            case_sensitive=case_sensitive,
+            fixed_strings=fixed_strings,
+            context_lines=context_lines,
+            branch=branch,
+        )
+    )
 
 
 def pull(project_root: str) -> PullResponse:

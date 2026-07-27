@@ -353,6 +353,47 @@ async def test_branch_search_finds_remote_tracking_branch(tmp_path: Path) -> Non
     project.close()
 
 
+_needs_rg = pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not installed")
+
+
+@_needs_rg
+async def test_ripgrep_searches_the_working_tree_without_an_index(tmp_path: Path) -> None:
+    """The ripgrep path reads the tree directly — no index pass required."""
+    (tmp_path / ".git").mkdir()
+    _write(tmp_path, "a.py", "def handle_login():\n    pass\n")
+    _write(tmp_path, "b.py", "# nothing here\n")
+
+    project = await _make_project(tmp_path)
+    outcome = await project.ripgrep("handle_login", limit=10)
+    assert [(m.file_path, m.line_number) for m in outcome.matches] == [("a.py", 1)]
+    assert outcome.truncated is False
+    project.close()
+
+
+@_needs_rg
+@_needs_git
+async def test_ripgrep_on_a_branch_sees_the_branch_version(tmp_path: Path) -> None:
+    """A branch ripgrep returns the branch's content, not the checked-out base's."""
+    _make_branch_repo(tmp_path)  # main: a.py=alpha; feature: a.py=gamma, adds c.py=delta
+    project = await _make_project(tmp_path)
+
+    base = await project.ripgrep("gamma", limit=10)
+    assert base.matches == ()
+
+    branch = await project.ripgrep("gamma", limit=10, branch="feature")
+    assert [m.file_path for m in branch.matches] == ["a.py"]
+    assert "gamma" in branch.matches[0].content
+
+    # The stale base version of a.py must not leak into a branch scan.
+    stale = await project.ripgrep("alpha", limit=10, branch="feature")
+    assert [m.file_path for m in stale.matches] == []
+
+    # A file that exists only on the branch is searchable too.
+    added = await project.ripgrep("delta", limit=10, branch="feature")
+    assert [m.file_path for m in added.matches] == ["c.py"]
+    project.close()
+
+
 @_needs_git
 async def test_branch_equal_to_base_is_plain_search(tmp_path: Path) -> None:
     """Passing the base ref as the branch is a normal base search (no overlay)."""

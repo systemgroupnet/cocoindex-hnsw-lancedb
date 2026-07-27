@@ -26,12 +26,32 @@
 FROM python:3.12-slim
 
 # git: needed by the daemon's optional daily git-pull step (see
-# cocoindex_code.schedule). gosu: drop to the coco/host user in the entrypoint.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends gosu git \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd -g 1000 coco \
-    && useradd -u 1000 -g 1000 -m coco
+# cocoindex_code.schedule) and by branch search. ripgrep: backs the MCP
+# `ripgrep` tool and the lexical branch fallback. gosu: drop to the coco/host
+# user in the entrypoint.
+#
+# The retry loop is not belt-and-braces: deb.debian.org's CDN intermittently
+# truncates a response mid-download ("500 reading HTTP response body:
+# unexpected EOF"), which fails the whole layer, and a different couple of files
+# fail each time. `-o Acquire::Retries` does *not* cover this (verified), but a
+# fresh `apt-get install` does — already-downloaded .debs stay in
+# /var/cache/apt/archives, so each attempt only refetches what's still missing
+# and the loop converges. Exhausting the attempts is a hard failure, never a
+# silently under-provisioned image.
+RUN set -eux; \
+    apt-get update; \
+    for attempt in 1 2 3 4 5; do \
+        apt-get install -y --no-install-recommends gosu git ripgrep && break; \
+        if [ "$attempt" = 5 ]; then \
+            echo "apt-get install failed after $attempt attempts" >&2; \
+            exit 1; \
+        fi; \
+        echo "apt-get install attempt $attempt failed (transient mirror error); retrying"; \
+        sleep 3; \
+    done; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd -g 1000 coco; \
+    useradd -u 1000 -g 1000 -m coco
 
 RUN --mount=type=cache,target=/root/.cache/pip pip install --quiet uv
 

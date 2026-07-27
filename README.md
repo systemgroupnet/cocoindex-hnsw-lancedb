@@ -15,6 +15,7 @@ Everything below is what this fork adds or emphasizes on top of upstream's seman
 - **Long-running daemon.** A background service keeps the embedding model resident and the index open, so searches are fast and the model loads only once. Connections are handled concurrently.
 - **MCP server, stdio and HTTP.** Run `ccc mcp` for a stdio server, or expose a streamable-HTTP MCP endpoint from the daemon (`COCOINDEX_CODE_MCP_PORT`) that many clients share against one warm process.
 - **Branch search.** Search *arbitrary git branches* — not just the checked-out one — via on-the-fly diff overlays, with a lexical fallback for very divergent branches. See [Branch search](#branch-search).
+- **`ripgrep` MCP tool.** Exact text/regex search alongside semantic search, branch-aware and index-free. See the [MCP tool reference](#coding-agent-integration-mcp).
 - **LanceDB + HNSW backend** with automatic disk compaction and recovery tooling. See [Vector search backend](#vector-search-backend-lancedb--hnsw).
 - **Container-aware memory governor** that sizes indexing concurrency to the cgroup limit and throttles under pressure. See [Limiting memory](#limiting-memory).
 - **Scheduled maintenance & git sync** — a daily `git pull → index → push metrics → evict overlays` workflow, built for repos kept as read-only mirrors. See [Scheduled maintenance & git sync](#scheduled-maintenance--git-sync).
@@ -102,7 +103,7 @@ codex mcp add cocoindex-code -- ccc mcp
 <details>
 <summary>MCP tool reference</summary>
 
-When running as an MCP server (`ccc mcp`, or the HTTP endpoint), one tool is exposed:
+When running as an MCP server (`ccc mcp`, or the HTTP endpoint), two tools are exposed:
 
 **`search`** — semantic code search across the codebase.
 
@@ -121,6 +122,26 @@ search(
 Returns matching code chunks with file path, language, code content, line numbers, a similarity `score`, and a `source` field (`"semantic"` or `"lexical"` — see [Branch search](#branch-search)).
 
 `refresh_index` defaults to **False**: the index is expected to be refreshed out of band (e.g. the scheduled `ccc index`), so searches read the current table directly. Set it True to force an incremental update before the query.
+
+**`ripgrep`** — exact text and regex search, powered by [ripgrep](https://github.com/BurntSushi/ripgrep).
+
+```
+ripgrep(
+    pattern: str,                        # Rust-regex pattern (or a literal, with fixed_strings)
+    limit: int = 50,                     # Maximum matches (1-1000)
+    globs: list[str] | None = None,      # rg glob filters; '!' excludes (e.g. ["src/**", "!**/tests/**"])
+    case_sensitive: bool = False,        # Default is case-insensitive
+    fixed_strings: bool = False,         # Treat the pattern as a literal string
+    context_lines: int = 0,              # Lines of context on each side (0-20)
+    branch: str | None = None,           # Git branch/ref to search (default: the checked-out base)
+)
+```
+
+Returns matches with `file_path`, `line_number`, `content` (the matching line, widened to the context window when `context_lines` is set), `start_line`/`end_line`, and a `truncated` flag telling you whether more matches exist beyond `limit`.
+
+Use `ripgrep` when you know the literal text — a symbol name, an error string, a config key — and `search` when you're looking for code by meaning. It reads the working tree directly, so it needs no index (and never triggers one), and it finds matches in files the index skips. It honors the repo's `.gitignore` and skips `.git` and `.cocoindex_code`. Requires the `rg` binary on the server (included in the Docker image).
+
+With `branch` set, it searches that ref's view of the tree using the same decomposition as [branch search](#branch-search): the base checkout minus the files the branch touched, plus the branch's own version of the files it added or modified — read from git, never checked out.
 </details>
 
 ## Manual CLI usage
@@ -141,6 +162,7 @@ ccc search "authentication logic"       # search!
 | `ccc index` | Build or update the index (auto-inits if needed). Shows streaming progress. |
 | `ccc pull` | Pull latest changes from the git upstream (fetch + hard-reset). Discards local changes to tracked files; built for repos kept as mirrors. See [Scheduled maintenance & git sync](#scheduled-maintenance--git-sync). |
 | `ccc search <query>` | Semantic search across the codebase (see [Search options](#search-options)) |
+| `ccc grep <pattern>` | Exact text/regex search via ripgrep — no index needed (see [Grep options](#grep-options)) |
 | `ccc status` | Show index stats (chunk count, file count, language breakdown) |
 | `ccc mcp` | Run as MCP server in stdio mode |
 | `ccc doctor` | Run diagnostics — checks settings, daemon, model, file matching, and index health |
@@ -163,6 +185,24 @@ ccc search --branch feature/login "auth flow"        # search a git branch (see 
 
 By default, `ccc search` scopes results to your current working directory (relative to the project root). Use `--path` to override.
 
+### Grep options
+
+`ccc grep` is exact text/regex search powered by [ripgrep](https://github.com/BurntSushi/ripgrep) — use it when you know the literal string, and `ccc search` when you're looking for code by meaning.
+
+```bash
+ccc grep 'def create_mcp_server'                     # regex search (case-insensitive)
+ccc grep -F 'cfg["retries"]'                         # literal string, metacharacters and all
+ccc grep -s TODO                                     # case-sensitive
+ccc grep -C 3 'raise RuntimeError'                   # 3 lines of context around each match
+ccc grep -g 'src/**/*.py' -g '!**/tests/**' NEEDLE   # include/exclude globs (repeatable)
+ccc grep --limit 200 COCOINDEX_CODE_                 # raise the 50-match default
+ccc grep --branch feature/login 'session_token'      # grep a git branch (see Branch search)
+```
+
+It reads the working tree directly, so it needs **no index** — it works before the first index pass, never triggers one, and finds matches in files the index skips. It honors the repo's `.gitignore` and skips `.git` and `.cocoindex_code`. Output is the familiar `file:line: text` (with `-C`, each context line is numbered and the matching line marked `>`). If more matches exist than `--limit`, a note goes to stderr so piped output stays clean.
+
+Requires the `rg` binary on the machine running the daemon — included in the Docker image; on a source checkout install it yourself (`apt-get install ripgrep`, `brew install ripgrep`, `winget install BurntSushi.ripgrep.MSVC`).
+
 ## Branch search
 
 The index is built from the **checked-out working tree** — normally the branch a deployment keeps reset to (the *base*). Branch search lets you query **any other git branch** without maintaining a full index per branch: it builds a small, ephemeral overlay from just the files the branch changed and merges it with the base index.
@@ -173,13 +213,20 @@ The index is built from the **checked-out working tree** — normally the branch
 
 Overlays are cached per commit SHA (a new commit invalidates the old one) and evicted when not searched within `COCOINDEX_CODE_BRANCH_OVERLAY_TTL_DAYS`.
 
+**`grep` is branch-aware too.** `ccc grep --branch` (and the `ripgrep` MCP tool's `branch`) resolves the ref through exactly the same path, then applies the same decomposition to a text scan: the base working tree minus the files the branch touched, plus rg over the branch's own version of the files it added or modified. No overlay table, no embedding, no index — so it's the cheap way to look at a branch, and the two tools can never disagree about what "the branch" contains.
+
 ```bash
 ccc search --branch feature/login "session handling"
+ccc grep --branch feature/login 'session_token'
 ```
 
 **Finding the branch.** The server's clone usually has only the base branch checked out, so `branch` is resolved in three steps: the ref as given (local branch, tag, or SHA), then each remote's `refs/remotes/<remote>/<name>` (a branch that was fetched but never checked out), then — if it's still missing — an on-demand `git fetch` of that one branch. The fetch reuses the `COCOINDEX_CODE_GIT_USERNAME` / `COCOINDEX_CODE_GIT_PASSWORD` credentials of the [scheduled pull](#scheduled-maintenance--git-sync), so a branch pushed minutes ago is searchable without waiting for the next pull.
 
-**A branch search never checks anything out.** Branch content is read straight out of the git object database — HEAD, the index, and the working tree are left byte-identical, and the only write is the fetch's remote-tracking ref. The checkout stays on the base branch, so parallel searches for different branches can't conflict with each other or with anything else using the repo.
+**Every branch search refreshes the clone first**, so a branch pushed moments ago is searchable without waiting for the next scheduled pull. It's best-effort — a failure is logged and the search continues on what the clone already has — and throttled to one refresh per `COCOINDEX_CODE_BRANCH_REFRESH_SECONDS` (default 60) so a burst of searches costs one round-trip. What it runs follows `COCOINDEX_CODE_GIT_PULL_ENABLED`: with the pull step **off** (the default) it's `git fetch --prune`, which leaves the checkout untouched; with it **on** it's the full pull (`fetch` + `reset --hard`), which also advances the base ref and working tree so the diff base is current.
+
+**Nothing is ever checked out** — by `search` or by `grep`. Branch content is read straight out of the git object database (`git show <sha>:<path>`); no code path runs `checkout`, `switch`, or `reset` for a search. HEAD, the index, the working tree, and the local branch list come out byte-identical, verified in the test suite for both tools. The checkout stays on the base branch, so parallel searches and greps of *different* branches can't conflict with each other, with an in-flight index pass, or with anything else using the repo.
+
+The one writer is the pre-search refresh above: it always updates `refs/remotes/*`, and — only when you've set `COCOINDEX_CODE_GIT_PULL_ENABLED` — hard-resets the tree. Even then it moves the **base** branch forward to its own upstream; it never switches to the branch being searched. With the pull gate off (the default), a branch search or grep cannot modify the working tree at all.
 
 | Env var | Default | Effect |
 |---|---|---|
@@ -187,6 +234,7 @@ ccc search --branch feature/login "session handling"
 | `COCOINDEX_CODE_BRANCH_MAX_CHANGED_FILES` | `50` | Above this many changed files, use the lexical fallback instead of a semantic overlay. |
 | `COCOINDEX_CODE_BRANCH_OVERLAY_TTL_DAYS` | `7` | Evict an overlay not searched within this many days. |
 | `COCOINDEX_CODE_BRANCH_FETCH_ENABLED` | on | Set falsy (`0`/`false`/`no`/`off`) to forbid the on-demand fetch, restricting search to refs already in the clone. |
+| `COCOINDEX_CODE_BRANCH_REFRESH_SECONDS` | `60` | Minimum seconds between pre-search clone refreshes; `0` refreshes on every search. |
 
 > **Current limitations.** The hardened read-only git guarantee layer is still deferred — tracked in [`docs/branch-search.md`](./docs/branch-search.md) (Future work), which documents the full design.
 
@@ -360,7 +408,7 @@ In the Docker image it targets the mounted repo (`/workspace`) at 03:00 local by
 | `COCOINDEX_CODE_GIT_USERNAME` | — | Optional HTTPS username (for a token, any non-empty value, e.g. `x-access-token`) |
 | `COCOINDEX_CODE_GIT_PASSWORD` | — | Optional HTTPS password / personal-access token |
 
-The two `GIT_` credentials are also used by [branch search](#branch-search)'s on-demand fetch, which is independent of `COCOINDEX_CODE_GIT_PULL_ENABLED` (it never touches the working tree).
+The two `GIT_` credentials are also used by [branch search](#branch-search)'s pre-search refresh and on-demand fetch. `COCOINDEX_CODE_GIT_PULL_ENABLED` gates the destructive part there too: with it off, branch search only ever fetches (no working-tree write); with it on, its pre-search refresh is a full pull.
 
 > **The git-pull step is destructive by design.** It runs `git fetch` then `git reset --hard` to the upstream branch, discarding any local changes to **tracked** files — it's built for repos kept as read-only mirrors. Untracked and ignored files (including `.cocoindex_code/`) are never touched. It's **off by default**; enable it only where that's what you want.
 
@@ -373,6 +421,7 @@ The two `GIT_` credentials are also used by [branch search](#branch-search)'s on
 - **Semantic code search**: find relevant code using natural language queries when grep doesn't work well, and save tokens immediately.
 - **Long-running service**: a warm daemon serves the CLI and MCP (stdio + HTTP) with the model loaded once.
 - **Branch search**: query arbitrary git branches via ephemeral diff overlays (see [Branch search](#branch-search)).
+- **Semantic *and* exact search**: `search` finds code by meaning; `ccc grep` / the `ripgrep` MCP tool finds literal text and regexes, index-free and branch-aware (see [Grep options](#grep-options)).
 - **Ultra performant**: ⚡ built on the [CocoIndex](https://github.com/cocoindex-io/cocoindex) Rust indexing engine. Only re-indexes changed files for fast updates.
 - **Multi-language support**: Python, JavaScript/TypeScript, Rust, Go, Java, C/C++, C#, SQL, Shell, and more (see [Supported languages](#supported-languages)).
 - **Built for concurrency**: an embedded [LanceDB](https://lancedb.github.io/lancedb/) + HNSW vector store serves searches concurrently — even while an index pass is writing — so multiple agents (or MCP sessions) query in parallel without blocking. See [Vector search backend](#vector-search-backend-lancedb--hnsw).
