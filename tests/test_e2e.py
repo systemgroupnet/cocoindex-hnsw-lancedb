@@ -871,13 +871,17 @@ async def test_daemon_check_model_maps_failure_to_doctor_result() -> None:
 
 
 def test_dockerfile_install_line_uses_full_extra() -> None:
-    """Dockerfile should install via `cocoindex-code[full]` (not the old
-    `[default]` alias) and should not hard-pin sentence-transformers.
+    """Dockerfile should install the `[full]` extra (not the old `[default]`
+    alias) and should not hard-pin sentence-transformers.
+
+    The install now comes from the bind-mounted local source tree
+    (`/ccc-src[full]`) rather than the published package name, so the guard is on
+    the extra, which is what actually decides the image's dependency set.
     """
     repo_root = Path(__file__).resolve().parent.parent
     content = (repo_root / "docker" / "Dockerfile").read_text()
-    assert "cocoindex-code[full]" in content
-    assert "cocoindex-code[default]" not in content
+    assert "[full]" in content
+    assert "[default]" not in content
     assert "sentence-transformers>=" not in content
     assert "sentence-transformers==" not in content
 

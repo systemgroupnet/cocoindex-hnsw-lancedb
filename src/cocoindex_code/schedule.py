@@ -35,7 +35,8 @@ Configuration (all via environment variables):
   token baked into the remote URL, etc.). For token auth the username is usually
   any non-empty value (e.g. the token itself, or ``x-access-token`` on GitHub);
   supply both to be safe. Ignored for SSH remotes, which don't use credential
-  helpers.
+  helpers. Defined in :mod:`cocoindex_code.git_ops` and shared with branch
+  search's on-demand fetch.
 """
 
 from __future__ import annotations
@@ -50,6 +51,8 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Literal
 
+from .git_ops import GitCredentials, credential_git_args, git_env, load_credentials
+
 logger = logging.getLogger(__name__)
 
 # --- Environment knobs (single source of truth) ----------------------------
@@ -58,8 +61,6 @@ ENV_ENABLED = "COCOINDEX_CODE_SCHEDULE_ENABLED"
 ENV_TIME = "COCOINDEX_CODE_SCHEDULE_TIME"
 ENV_WORKSPACES = "COCOINDEX_CODE_SCHEDULE_WORKSPACES"
 ENV_GIT_PULL_ENABLED = "COCOINDEX_CODE_GIT_PULL_ENABLED"
-ENV_GIT_USERNAME = "COCOINDEX_CODE_GIT_USERNAME"
-ENV_GIT_PASSWORD = "COCOINDEX_CODE_GIT_PASSWORD"
 
 _DEFAULT_TIME = time(3, 0)
 
@@ -68,31 +69,8 @@ _DEFAULT_TIME = time(3, 0)
 # the workflow moves on.
 _GIT_TIMEOUT_SECONDS = 300
 
-# Environment names the inline credential helper reads. Distinct from the
-# user-facing ENV_GIT_* knobs: we set these on the git subprocess env explicitly
-# so the helper's value can stay a fixed, secret-free string.
-_CRED_ENV_USERNAME = "CCC_GIT_CRED_USERNAME"
-_CRED_ENV_PASSWORD = "CCC_GIT_CRED_PASSWORD"
-
-# Inline git credential helper: on a `get`, echo the credentials from the
-# environment in git's credential-protocol format. The password never appears in
-# argv (only this fixed string does) nor on disk. A leading `!` makes git run it
-# through a shell; the helper ignores git's `get`/`store`/`erase` argument.
-_CREDENTIAL_HELPER = (
-    f'!f() {{ echo "username=${_CRED_ENV_USERNAME}"; '
-    f'echo "password=${_CRED_ENV_PASSWORD}"; }}; f'
-)
-
 _FALSY = {"0", "false", "no", "off"}
 _TRUTHY = {"1", "true", "yes", "on"}
-
-
-@dataclass(frozen=True)
-class GitCredentials:
-    """HTTPS username + password/token for the git-pull step."""
-
-    username: str
-    password: str
 
 
 @dataclass(frozen=True)
@@ -178,22 +156,12 @@ def load_config() -> ScheduleConfig:
     git_raw = os.environ.get(ENV_GIT_PULL_ENABLED)
     git_pull_enabled = git_raw is not None and _is_truthy(git_raw)
 
-    # Credentials are active only when a password/token is present; the username
-    # is optional (some hosts accept any value for token auth). Don't strip the
-    # password — a token is used verbatim.
-    password = os.environ.get(ENV_GIT_PASSWORD) or ""
-    git_credentials = (
-        GitCredentials(username=(os.environ.get(ENV_GIT_USERNAME) or "").strip(), password=password)
-        if password
-        else None
-    )
-
     return ScheduleConfig(
         enabled=enabled,
         run_time=_parse_time(os.environ.get(ENV_TIME)),
         workspaces=_parse_workspaces(os.environ.get(ENV_WORKSPACES)),
         git_pull_enabled=git_pull_enabled,
-        git_credentials=git_credentials,
+        git_credentials=load_credentials(),
     )
 
 
@@ -239,27 +207,16 @@ class GitUpdateResult:
     message: str
 
 
-def _credential_git_args(credentials: GitCredentials | None) -> list[str]:
-    """The ``-c credential.helper=...`` args that inject *credentials*, if any."""
-    if credentials is None:
-        return []
-    return ["-c", f"credential.helper={_CREDENTIAL_HELPER}"]
-
-
-def _git_env(credentials: GitCredentials | None) -> dict[str, str]:
-    # GIT_TERMINAL_PROMPT=0 makes git fail fast instead of blocking on a
-    # credential prompt in the non-interactive daemon. When credentials are
-    # configured, expose them under the names the inline helper reads.
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    if credentials is not None:
-        env[_CRED_ENV_USERNAME] = credentials.username
-        env[_CRED_ENV_PASSWORD] = credentials.password
-    return env
-
-
 def _run_git(
     root: Path, *args: str, credentials: GitCredentials | None = None
 ) -> subprocess.CompletedProcess[str]:
+    """Run a git command for the maintenance workflow (its own longer timeout).
+
+    Separate from :func:`git_ops._run_git` — this one runs the working-tree
+    write (``reset --hard``) and talks to a remote with a 300s ceiling, while
+    ``git_ops`` stays on the short, read-oriented budget. Both build the
+    credential args and environment from the same shared helpers.
+    """
     # -c safe.directory=<root>: a bind-mounted repo is often owned by a
     # different UID than the daemon process (host user vs. the container's coco
     # user), which otherwise makes git refuse with "detected dubious ownership".
@@ -270,13 +227,13 @@ def _run_git(
             str(root),
             "-c",
             f"safe.directory={root}",
-            *_credential_git_args(credentials),
+            *credential_git_args(credentials),
             *args,
         ],
         capture_output=True,
         text=True,
         timeout=_GIT_TIMEOUT_SECONDS,
-        env=_git_env(credentials),
+        env=git_env(credentials),
         check=False,
     )
 

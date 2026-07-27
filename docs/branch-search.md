@@ -75,6 +75,48 @@ overlay build can briefly serialize behind an in-flight index pass on the
 indexing embedder's lock. Overlays are cached, so this is a one-time cost per
 branch commit.)
 
+## Ref resolution
+
+The daemon's clone only ever checks out the base branch, so a feature branch
+normally exists there as a *remote-tracking* ref — or not at all, if it was
+pushed after the last scheduled pull. `git rev-parse` does none of the DWIM that
+`git checkout` does, so resolving `X` walks three steps and stops at the first
+hit:
+
+1. **`X` as given** — a local branch, a tag, or a SHA.
+2. **`refs/remotes/<remote>/X`**, for each configured remote (`origin` first) —
+   the common case for a branch that has been fetched but never checked out. No
+   network.
+3. **On-demand fetch** — `git fetch <remote> +refs/heads/X:refs/remotes/<remote>/X`,
+   then resolve again. Writes only objects and the remote-tracking ref; never the
+   working tree, the index, or a local branch. Because the fetch uses an explicit
+   refspec (rather than leaving the result in `FETCH_HEAD`), the branch becomes a
+   normal remote-tracking ref and later searches resolve it with no network at
+   all. Controlled by `COCOINDEX_CODE_BRANCH_FETCH_ENABLED` (on by default) and
+   authenticated with the same `COCOINDEX_CODE_GIT_USERNAME` /
+   `COCOINDEX_CODE_GIT_PASSWORD` credentials the scheduled pull uses, injected
+   via the same inline credential helper (never on disk, never in argv). Only
+   plain branch names are fetchable; tags and SHAs must already be in the clone.
+
+The resolved SHA — not the caller's ref string — is what `git diff` and
+`git show` are given downstream, since a bare `X` would not resolve when the
+branch lives only under `refs/remotes/`.
+
+**No checkout, ever.** Branch content is read out of the object database with
+`git show <sha>:<path>`; nothing runs `checkout`/`switch`/`reset`. HEAD, the
+index, the working tree, and the local branch list are byte-identical before and
+after a branch search (regression-guarded in
+`test_branch_search_git_calls_leave_the_checkout_alone`). That is what lets the
+daemon serve parallel searches for different branches against one clone whose
+working tree stays on the base. The single write is the fetch's remote-tracking
+ref: two searches racing to fetch the *same* new branch contend on git's per-ref
+lock, so the loser re-checks locally — by then the winner's ref is there — rather
+than failing.
+
+Caller-supplied refs are rejected before reaching a command line if they could be
+read as a git option (leading `-`) or contain whitespace; a ref that will be
+fetched must additionally look like a plain branch name.
+
 ## Query paths
 
 A branch's divergence from the base decides the path, gated by
@@ -82,8 +124,9 @@ A branch's divergence from the base decides the path, gated by
 
 ### Low divergence — semantic overlay
 
-1. Resolve `X` → commit SHA (`git rev-parse`). The SHA is the overlay cache key,
-   so a new commit / force-push transparently invalidates the old overlay.
+1. Resolve `X` → commit SHA (see [Ref resolution](#ref-resolution)). The SHA is
+   the overlay cache key, so a new commit / force-push transparently invalidates
+   the old overlay, and every later git call addresses the branch by SHA.
 2. `git diff --name-status <merge-base>..X` → added/modified/deleted sets,
    filtered by the same include/exclude/gitignore matchers the base indexer uses.
 3. Build (or reuse) `overlay_<sha>`: read each added/modified file via
@@ -135,25 +178,24 @@ in the daily maintenance workflow. Eviction is a `drop_table` + sidecar prune.
 | `COCOINDEX_CODE_BASE_REF` | auto (`HEAD`) | Ref the base index represents / diff base. |
 | `COCOINDEX_CODE_BRANCH_MAX_CHANGED_FILES` | `50` | Above this, use the lexical fallback instead of a semantic overlay. |
 | `COCOINDEX_CODE_BRANCH_OVERLAY_TTL_DAYS` | `7` | Evict an overlay not searched within this many days. |
+| `COCOINDEX_CODE_BRANCH_FETCH_ENABLED` | on | Set falsy to forbid the on-demand fetch, restricting search to refs already in the clone. |
+| `COCOINDEX_CODE_GIT_USERNAME` / `COCOINDEX_CODE_GIT_PASSWORD` | unset | HTTPS credentials for the on-demand fetch (shared with the scheduled pull). |
 
 ## Future work (deferred, tracked)
 
-The current implementation reads git with plain read-only plumbing
-(`rev-parse`, `merge-base`, `diff`, `show`) and does **not** yet include the
-hardened read-only guarantee layer. Before this is exposed to untrusted branch
-input in production, add:
+The current implementation drives git with plumbing that reads
+(`rev-parse`, `diff`, `show`, `remote`) plus the one narrowly scoped fetch above,
+and does **not** yet include the hardened read-only guarantee layer. Before this
+is exposed to untrusted branch input in production, add:
 
 1. **Enforced read-only git layer.** An allowlist wrapper permitting only
-   read-only subcommands, every invocation run with `GIT_INDEX_FILE` pointed at a
-   temp path so the real index/working tree cannot be mutated even by a
-   mis-issued command. This is the guarantee that branch search never disturbs
-   the base index's source tree.
-2. **On-demand fetch.** `git fetch origin <branch>` for branches not present
-   locally (writes only objects/refs, never the working tree), so *any* remote
-   branch is searchable. Until this lands, the requested branch must already
-   exist in the local clone.
-3. **SHA-pinned diff base.** Pin the diff base to the commit actually indexed
+   read-only subcommands (plus the fetch), every invocation run with
+   `GIT_INDEX_FILE` pointed at a temp path so the real index/working tree cannot
+   be mutated even by a mis-issued command. This is the guarantee that branch
+   search never disturbs the base index's source tree; today the ref validation
+   in [Ref resolution](#ref-resolution) is what stands in for it.
+2. **SHA-pinned diff base.** Pin the diff base to the commit actually indexed
    into `code_chunks` (closing the staleness window above).
-4. **Worktree option.** For very large diffs, a read-only sparse worktree that
+3. **Worktree option.** For very large diffs, a read-only sparse worktree that
    reuses the full CocoIndex incremental pipeline instead of the in-memory blob
    path.

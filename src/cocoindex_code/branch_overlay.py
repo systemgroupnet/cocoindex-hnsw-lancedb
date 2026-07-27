@@ -111,17 +111,24 @@ class BranchOverlayManager:
     ) -> list[SearchResult]:
         """Search *branch_ref* overlaid on the base index.
 
-        Raises ``RuntimeError`` when the branch can't be resolved in the local
-        clone (no fetch yet) or the diff can't be computed.
+        Raises ``RuntimeError`` when the branch can't be resolved (locally or by
+        fetching it) or the diff can't be computed.
         """
-        branch_sha = git_ops.resolve_commit(self._root, branch_ref)
+        # Resolution can fetch, so it runs off the event loop. Everything after
+        # this point addresses the branch by SHA: the ref may live only as
+        # `refs/remotes/<remote>/<branch>`, which `git diff`/`git show` would not
+        # find under its bare name.
+        branch_sha = await asyncio.to_thread(
+            git_ops.resolve_commit,
+            self._root,
+            branch_ref,
+            allow_fetch=git_ops.fetch_enabled(),
+            credentials=git_ops.load_credentials(),
+        )
         if branch_sha is None:
-            raise RuntimeError(
-                f"ref {branch_ref!r} not found in the local clone "
-                f"(on-demand fetch is not enabled yet — fetch it first)"
-            )
+            raise RuntimeError(_unresolved_message(branch_ref))
 
-        diff = git_ops.branch_diff(self._root, base_ref, branch_ref)
+        diff = git_ops.branch_diff(self._root, base_ref, branch_sha)
         if diff is None:
             raise RuntimeError(
                 f"could not diff {branch_ref!r} against base {base_ref!r} "
@@ -154,7 +161,7 @@ class BranchOverlayManager:
             _int_env(ENV_MAX_CHANGED_FILES, _DEFAULT_MAX_CHANGED_FILES),
         )
         return await self._search_lexical(
-            query=query, branch_ref=branch_ref, main_table=main_table,
+            query=query, branch_sha=branch_sha, main_table=main_table,
             embed_paths=embed_paths, shadow_paths=shadow_paths,
             languages=languages, paths=paths, limit=limit, offset=offset,
         )
@@ -211,7 +218,7 @@ class BranchOverlayManager:
                 self._touch(name)
                 return await conn.open_table(name)
 
-            rows = await self._build_rows(branch_ref, embed_paths)
+            rows = await self._build_rows(branch_sha, embed_paths)
             if not rows:
                 return None
 
@@ -224,7 +231,7 @@ class BranchOverlayManager:
             )
             return table
 
-    async def _build_rows(self, branch_ref: str, embed_paths: list[str]) -> list[dict[str, Any]]:
+    async def _build_rows(self, branch_sha: str, embed_paths: list[str]) -> list[dict[str, Any]]:
         """Chunk + embed each branch file into LanceDB row dicts.
 
         Uses the *indexing* embedder + params (not the query embedder) so overlay
@@ -241,7 +248,7 @@ class BranchOverlayManager:
         rows: list[dict[str, Any]] = []
         rid = 0
         for path in embed_paths:
-            content = git_ops.read_blob(self._root, branch_ref, path)
+            content = git_ops.read_blob(self._root, branch_sha, path)
             if content is None or not content.strip():
                 continue
             async with governor.slot():
@@ -271,7 +278,7 @@ class BranchOverlayManager:
         self,
         *,
         query: str,
-        branch_ref: str,
+        branch_sha: str,
         main_table: AsyncTable,
         embed_paths: list[str],
         shadow_paths: list[str],
@@ -292,7 +299,7 @@ class BranchOverlayManager:
         ext_lang_map = self._language_overrides()
         lex_files: list[LexicalFile] = []
         for path in embed_paths:
-            content = git_ops.read_blob(self._root, branch_ref, path)
+            content = git_ops.read_blob(self._root, branch_sha, path)
             if content is None or not content.strip():
                 continue
             lex_files.append(LexicalFile(path, content, _detect_language(path, ext_lang_map)))
@@ -392,6 +399,20 @@ class BranchOverlayManager:
                 meta.pop(name, None)
             self._save_meta(meta)
             logger.info("Evicted %d stale branch overlay(s): %s", len(stale), ", ".join(stale))
+
+
+def _unresolved_message(branch_ref: str) -> str:
+    """Why *branch_ref* couldn't be resolved — the fix differs by fetch setting."""
+    if git_ops.fetch_enabled():
+        return (
+            f"ref {branch_ref!r} could not be resolved: no local branch, tag, or "
+            f"remote-tracking ref matches it, and fetching it from the remote failed "
+            f"(check the branch name, the remote, and the git credentials)"
+        )
+    return (
+        f"ref {branch_ref!r} not found in the local clone and on-demand fetch is "
+        f"disabled ({git_ops.ENV_FETCH_ENABLED}); fetch it first or re-enable fetching"
+    )
 
 
 def _detect_language(path: str, ext_lang_map: dict[str, str]) -> str:

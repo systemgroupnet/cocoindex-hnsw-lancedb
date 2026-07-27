@@ -8,15 +8,15 @@ from pathlib import Path
 
 import pytest
 
-from cocoindex_code import schedule
+from cocoindex_code import git_ops, schedule
 
 _SCHEDULE_ENV = [
     schedule.ENV_ENABLED,
     schedule.ENV_TIME,
     schedule.ENV_WORKSPACES,
     schedule.ENV_GIT_PULL_ENABLED,
-    schedule.ENV_GIT_USERNAME,
-    schedule.ENV_GIT_PASSWORD,
+    git_ops.ENV_GIT_USERNAME,
+    git_ops.ENV_GIT_PASSWORD,
 ]
 
 
@@ -89,17 +89,20 @@ def test_workspaces_skips_nonexistent(
 
 
 # --- credentials ------------------------------------------------------------
+#
+# The credential primitives themselves live in git_ops (shared with branch
+# search's fetch) and are tested there; these cover the schedule wiring.
 
 
 def test_credentials_require_password(monkeypatch: pytest.MonkeyPatch) -> None:
     # Username alone (no password/token) does not activate credential injection.
-    monkeypatch.setenv(schedule.ENV_GIT_USERNAME, "someone")
+    monkeypatch.setenv(git_ops.ENV_GIT_USERNAME, "someone")
     assert schedule.load_config().git_credentials is None
 
 
 def test_credentials_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(schedule.ENV_GIT_USERNAME, "x-access-token")
-    monkeypatch.setenv(schedule.ENV_GIT_PASSWORD, "ghp_secret")
+    monkeypatch.setenv(git_ops.ENV_GIT_USERNAME, "x-access-token")
+    monkeypatch.setenv(git_ops.ENV_GIT_PASSWORD, "ghp_secret")
     creds = schedule.load_config().git_credentials
     assert creds is not None
     assert creds.username == "x-access-token"
@@ -107,7 +110,7 @@ def test_credentials_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_credentials_password_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(schedule.ENV_GIT_PASSWORD, "ghp_secret")
+    monkeypatch.setenv(git_ops.ENV_GIT_PASSWORD, "ghp_secret")
     creds = schedule.load_config().git_credentials
     assert creds is not None
     assert creds.username == ""
@@ -115,36 +118,10 @@ def test_credentials_password_only(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_describe_config_masks_password(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(schedule.ENV_GIT_PASSWORD, "ghp_supersecret")
+    monkeypatch.setenv(git_ops.ENV_GIT_PASSWORD, "ghp_supersecret")
     summary = schedule.describe_config(schedule.load_config())
     assert "ghp_supersecret" not in summary
     assert "git_creds=set" in summary
-
-
-def test_credential_git_args_present_only_with_creds() -> None:
-    assert schedule._credential_git_args(None) == []
-    args = schedule._credential_git_args(
-        schedule.GitCredentials("distinct-user-xyz", "distinct-secret-xyz")
-    )
-    assert args[0] == "-c"
-    assert args[1].startswith("credential.helper=")
-    # The helper string carries no secret — it reads them from the environment,
-    # so nothing sensitive lands in the process argv.
-    assert "distinct-user-xyz" not in args[1]
-    assert "distinct-secret-xyz" not in args[1]
-
-
-def test_git_env_injects_credentials() -> None:
-    env = schedule._git_env(schedule.GitCredentials("user", "tok"))
-    assert env["GIT_TERMINAL_PROMPT"] == "0"
-    assert env[schedule._CRED_ENV_USERNAME] == "user"
-    assert env[schedule._CRED_ENV_PASSWORD] == "tok"
-
-
-def test_git_env_no_credentials() -> None:
-    env = schedule._git_env(None)
-    assert env["GIT_TERMINAL_PROMPT"] == "0"
-    assert schedule._CRED_ENV_PASSWORD not in env
 
 
 # --- timing -----------------------------------------------------------------

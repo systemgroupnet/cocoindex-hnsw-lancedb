@@ -177,13 +177,18 @@ Overlays are cached per commit SHA (a new commit invalidates the old one) and ev
 ccc search --branch feature/login "session handling"
 ```
 
+**Finding the branch.** The server's clone usually has only the base branch checked out, so `branch` is resolved in three steps: the ref as given (local branch, tag, or SHA), then each remote's `refs/remotes/<remote>/<name>` (a branch that was fetched but never checked out), then — if it's still missing — an on-demand `git fetch` of that one branch. The fetch reuses the `COCOINDEX_CODE_GIT_USERNAME` / `COCOINDEX_CODE_GIT_PASSWORD` credentials of the [scheduled pull](#scheduled-maintenance--git-sync), so a branch pushed minutes ago is searchable without waiting for the next pull.
+
+**A branch search never checks anything out.** Branch content is read straight out of the git object database — HEAD, the index, and the working tree are left byte-identical, and the only write is the fetch's remote-tracking ref. The checkout stays on the base branch, so parallel searches for different branches can't conflict with each other or with anything else using the repo.
+
 | Env var | Default | Effect |
 |---|---|---|
 | `COCOINDEX_CODE_BASE_REF` | auto (`HEAD`) | The ref the base index represents / the diff base. Auto-detected from the checked-out branch; override when it differs. |
 | `COCOINDEX_CODE_BRANCH_MAX_CHANGED_FILES` | `50` | Above this many changed files, use the lexical fallback instead of a semantic overlay. |
 | `COCOINDEX_CODE_BRANCH_OVERLAY_TTL_DAYS` | `7` | Evict an overlay not searched within this many days. |
+| `COCOINDEX_CODE_BRANCH_FETCH_ENABLED` | on | Set falsy (`0`/`false`/`no`/`off`) to forbid the on-demand fetch, restricting search to refs already in the clone. |
 
-> **Current limitations.** The requested branch must already exist in the server's local clone — on-demand `git fetch` is not enabled yet. The hardened read-only git guarantee layer is also deferred. Both are tracked in [`docs/branch-search.md`](./docs/branch-search.md) (Future work), which documents the full design.
+> **Current limitations.** The hardened read-only git guarantee layer is still deferred — tracked in [`docs/branch-search.md`](./docs/branch-search.md) (Future work), which documents the full design.
 
 ## Docker
 
@@ -354,6 +359,8 @@ In the Docker image it targets the mounted repo (`/workspace`) at 03:00 local by
 | `COCOINDEX_CODE_GIT_PULL_ENABLED` | **off** | Set truthy to enable the git-pull step |
 | `COCOINDEX_CODE_GIT_USERNAME` | — | Optional HTTPS username (for a token, any non-empty value, e.g. `x-access-token`) |
 | `COCOINDEX_CODE_GIT_PASSWORD` | — | Optional HTTPS password / personal-access token |
+
+The two `GIT_` credentials are also used by [branch search](#branch-search)'s on-demand fetch, which is independent of `COCOINDEX_CODE_GIT_PULL_ENABLED` (it never touches the working tree).
 
 > **The git-pull step is destructive by design.** It runs `git fetch` then `git reset --hard` to the upstream branch, discarding any local changes to **tracked** files — it's built for repos kept as read-only mirrors. Untracked and ignored files (including `.cocoindex_code/`) are never touched. It's **off by default**; enable it only where that's what you want.
 

@@ -314,8 +314,42 @@ async def test_branch_search_unknown_ref_raises(tmp_path: Path) -> None:
     project = await _make_project(tmp_path)
     await project.run_index()
 
-    with pytest.raises(RuntimeError, match="not found in the local clone"):
+    with pytest.raises(RuntimeError, match="could not be resolved"):
         await project.search("gamma", limit=5, branch="no-such-branch")
+    project.close()
+
+
+@_needs_git
+async def test_branch_search_finds_remote_tracking_branch(tmp_path: Path) -> None:
+    """The deployment case: the branch exists only as origin/<name> in the clone.
+
+    The daemon's clone only ever checks out the base branch, so a feature branch
+    lands as ``refs/remotes/origin/feature`` — searching it by bare name must
+    still work.
+    """
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    _git(origin, "init", "--bare", "-b", "main")
+
+    author = tmp_path / "author"
+    author.mkdir()
+    _make_branch_repo(author)
+    _git(author, "remote", "add", "origin", str(origin))
+    _git(author, "push", "-u", "origin", "main")
+    _git(author, "push", "origin", "feature")
+
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", str(origin), str(clone))
+
+    project = await _make_project(clone)
+    await project.run_index()  # indexes 'main' (the base)
+
+    results = await project.search("gamma", limit=5, branch="feature")
+    assert results
+    assert results[0].file_path == "a.py"
+    assert "gamma" in results[0].content
+    # The working tree stayed on the base throughout.
+    assert (clone / "a.py").read_text() == "alpha alpha alpha\n"
     project.close()
 
 
