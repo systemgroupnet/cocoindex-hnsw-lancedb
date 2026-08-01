@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -407,6 +408,44 @@ def branch_diff(root: Path, base_ref: str, branch_ref: str) -> BranchDiff | None
             modified.append(path)
 
     return BranchDiff(added=tuple(added), modified=tuple(modified), deleted=tuple(deleted))
+
+
+def blob_sizes(root: Path, ref: str, paths: Sequence[str]) -> dict[str, int]:
+    """Byte sizes of ``ref:path`` for each of *paths*, in one ``git cat-file`` pass.
+
+    Paths whose blob is missing (or whose size git doesn't report) are omitted
+    — the caller falls back to measuring after the read. Exists so an oversized
+    blob can be skipped *before* :func:`read_blob` pulls it into memory, which
+    is the only point at which the cost is still avoidable.
+    """
+    if not paths or not _is_safe_ref(ref):
+        return {}
+    try:
+        proc = subprocess.run(
+            [
+                "git", "-C", str(root), "-c", f"safe.directory={root}",
+                # -z: NUL-delimited input, so a path containing a newline can't
+                # desynchronize the request list from the reply lines.
+                "cat-file", "--batch-check=%(objectsize)", "-z",
+            ],
+            input="".join(f"{ref}:{p}\0" for p in paths),
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            env=git_env(None),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    # One reply line per request, in order: the size, or "<input> missing".
+    sizes: dict[str, int] = {}
+    for path, line in zip(paths, proc.stdout.splitlines()):
+        text = line.strip()
+        if text.isdigit():
+            sizes[path] = int(text)
+    return sizes
 
 
 def read_blob(root: Path, ref: str, path: str) -> str | None:

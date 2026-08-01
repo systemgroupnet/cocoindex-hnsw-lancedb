@@ -33,8 +33,10 @@ from ._version import __version__
 from .chunking import ChunkerFn as _ChunkerFn
 from .embedder_params import resolve_embedder_params
 from .memory import (
+    ENV_MAX_CONCURRENT_SCANS,
     ENV_MEMORY_LIMIT_MB,
     SAFETY_MARGIN_FRACTION,
+    SCAN_QUEUE_WARN_SECONDS,
     MemoryGovernor,
     current_usage_bytes,
     detect_memory_limit_bytes,
@@ -489,7 +491,25 @@ def _check_memory(governor: MemoryGovernor) -> DoctorCheckResult:
         f"Idle baseline: {format_bytes(s.baseline_bytes)}",
         f"Current usage: {format_bytes(s.current_bytes)}",
         f"Max in-flight files: {s.max_inflight} (current gate: {s.current_capacity})",
+        (
+            f"Max concurrent text scans: {s.scan_budget.max_concurrent} "
+            f"(current gate: {s.current_scan_capacity}); per scan: "
+            f"branch-blob batch {format_bytes(s.scan_budget.blob_batch_bytes)}, "
+            f"file size cap {format_bytes(s.scan_budget.max_filesize_bytes)}"
+        ),
+        (
+            f"Text scan queue: {s.scans_running} running, {s.scans_queued} queued "
+            f"(peak queued: {s.peak_scans_queued})"
+        ),
     ]
+    if s.delayed_scans:
+        # Queued scans are served, never rejected — so a growing count here is a
+        # latency signal (and a hint to raise the pool), not an error.
+        details.append(
+            f"Scans delayed over {SCAN_QUEUE_WARN_SECONDS:.0f}s: {s.delayed_scans} "
+            f"(longest wait: {s.max_scan_wait_seconds:.1f}s). Raise "
+            f"{ENV_MAX_CONCURRENT_SCANS} if there's memory headroom."
+        )
     frac = s.usage_fraction
     if frac is not None:
         details.append(f"Usage: {frac * 100:.0f}% of limit")
@@ -498,7 +518,8 @@ def _check_memory(governor: MemoryGovernor) -> DoctorCheckResult:
     if s.limit_bytes is None:
         details.append(
             f"No memory limit detected — indexing uses the default cap and no live "
-            f"throttling. Set {ENV_MEMORY_LIMIT_MB} to enable the OOM guard."
+            f"throttling, and text scans use fixed defaults rather than a sized "
+            f"budget. Set {ENV_MEMORY_LIMIT_MB} to enable the OOM guard."
         )
     return DoctorCheckResult(name="Memory", ok=True, details=details, errors=[])
 

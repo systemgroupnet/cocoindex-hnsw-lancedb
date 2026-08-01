@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from cocoindex_code import ripgrep
+from cocoindex_code import git_ops, ripgrep
+from cocoindex_code.memory import DEFAULT_SCAN_BUDGET, ScanBudget
 from cocoindex_code.settings import SETTINGS_DIR_NAME
 
 _needs_rg = pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not installed")
@@ -315,6 +317,138 @@ def test_search_branch_limit_applies_to_the_merged_result(branch_repo: Path) -> 
     assert outcome is not None
     assert len(outcome.matches) == 2
     assert outcome.truncated is True
+
+
+# --- resource bounds ----------------------------------------------------------
+#
+# These assert the *bounds*, not the byte counts behind them: a branch scan
+# holds one batch at a time, an oversized blob is never read, and a match's
+# retained text is capped. All hold whatever the governor sized the budget to.
+
+
+def _budget(**kwargs: Any) -> ScanBudget:
+    fields: dict[str, Any] = {
+        "max_concurrent": 1,
+        "blob_batch_bytes": DEFAULT_SCAN_BUDGET.blob_batch_bytes,
+        "max_filesize_bytes": DEFAULT_SCAN_BUDGET.max_filesize_bytes,
+    }
+    return ScanBudget(**{**fields, **kwargs})
+
+
+@_needs_git
+def test_blob_batches_never_exceed_the_batch_budget(branch_repo: Path) -> None:
+    """Peak resident branch text is one batch, however many files changed."""
+    sha = _out(branch_repo, "rev-parse", "feature")
+    paths = ["added.py", "mod.py"]
+    # Each file is ~16-18 bytes; a 20-byte budget forces one file per batch.
+    batches = list(ripgrep._blob_batches(branch_repo, sha, paths, _budget(blob_batch_bytes=20)))
+
+    assert len(batches) == 2  # not one dict holding both files
+    for batch in batches:
+        assert sum(len(c) for c in batch.values()) <= 20 or len(batch) == 1
+    # Batching changes when files are read, never which ones.
+    assert {p for b in batches for p in b} == set(paths)
+
+
+@_needs_git
+def test_blob_batches_skip_oversized_files_without_reading_them(
+    branch_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file cut is applied from git's size record, before any read."""
+    sha = _out(branch_repo, "rev-parse", "feature")
+    reads: list[str] = []
+    # Bound before patching: git_ops.read_blob *is* the attribute being replaced,
+    # so calling it by name inside the stub would recurse.
+    real_read: Callable[[Path, str, str], str | None] = git_ops.read_blob
+
+    def tracked_read(root: Path, ref: str, path: str) -> str | None:
+        reads.append(path)
+        return real_read(root, ref, path)
+
+    monkeypatch.setattr(ripgrep.git_ops, "read_blob", tracked_read)
+
+    batches = list(
+        ripgrep._blob_batches(
+            branch_repo, sha, ["added.py", "mod.py"], _budget(max_filesize_bytes=1)
+        )
+    )
+    assert batches == []
+    assert reads == []  # skipped on size alone — never pulled into memory
+
+
+@_needs_git
+def test_blob_sizes_match_the_content_git_returns(branch_repo: Path) -> None:
+    """The pre-read size check has to agree with what read_blob later produces."""
+    sha = _out(branch_repo, "rev-parse", "feature")
+    paths = ["added.py", "mod.py"]
+    sizes = git_ops.blob_sizes(branch_repo, sha, paths)
+    assert set(sizes) == set(paths)
+    for path in paths:
+        content = git_ops.read_blob(branch_repo, sha, path)
+        assert content is not None
+        assert sizes[path] == len(content.encode("utf-8"))
+
+
+@_needs_git
+def test_blob_sizes_of_a_missing_path_is_omitted(branch_repo: Path) -> None:
+    sha = _out(branch_repo, "rev-parse", "feature")
+    assert git_ops.blob_sizes(branch_repo, sha, ["nope.py"]) == {}
+
+
+def test_context_expansion_reads_a_file_once_per_scan() -> None:
+    """Many matches in one file must not mean many full reads of it."""
+    reads: list[str] = []
+
+    def counting_read(rel: str) -> list[str]:
+        reads.append(rel)
+        return ["needle"] * 50
+
+    cached = ripgrep._one_file_cache(counting_read)
+    query = _query("needle", context_lines=2)
+    for line_number in range(1, 21):
+        ripgrep._build_match("big.py", line_number, "needle", query, cached)
+
+    assert reads == ["big.py"]  # 20 matches, one read
+
+
+def test_long_lines_are_capped_and_marked() -> None:
+    """`limit` bounds how many matches come back, not how big each one is."""
+    long_line = "x" * (ripgrep._MAX_LINE_CHARS + 500)
+    match = ripgrep._build_match("a.js", 1, long_line, _query("x"), lambda rel: [])
+    assert len(match.content) == ripgrep._MAX_LINE_CHARS + len(ripgrep._TRUNCATION_MARKER)
+    assert match.content.endswith(ripgrep._TRUNCATION_MARKER)
+
+
+def test_context_lines_are_capped_individually() -> None:
+    """Capping per line keeps start_line/end_line honest about the window."""
+    lines = ["short", "y" * (ripgrep._MAX_LINE_CHARS + 10), "also short"]
+    match = ripgrep._build_match(
+        "a.js", 2, lines[1], _query("y", context_lines=1), lambda rel: lines
+    )
+    got = match.content.split("\n")
+    assert len(got) == 3
+    assert (got[0], got[2]) == ("short", "also short")
+    assert got[1].endswith(ripgrep._TRUNCATION_MARKER)
+    assert (match.start_line, match.end_line) == (1, 3)
+
+
+@_needs_rg
+@_needs_git
+def test_batched_branch_search_finds_what_an_unbatched_one_does(branch_repo: Path) -> None:
+    """A batch budget changes cost, not results."""
+    sha = _out(branch_repo, "rev-parse", "feature")
+    kwargs: dict[str, Any] = {
+        "branch_sha": sha,
+        "branch_paths": ["added.py", "mod.py"],
+        "shadow_paths": ["mod.py", "gone.py"],
+    }
+    roomy = ripgrep.search_branch(branch_repo, _query("NEEDLE"), **kwargs)
+    one_file_at_a_time = ripgrep.search_branch(
+        branch_repo, _query("NEEDLE"), budget=_budget(blob_batch_bytes=20), **kwargs
+    )
+    assert roomy is not None and one_file_at_a_time is not None
+    assert roomy.matches == one_file_at_a_time.matches
+    assert one_file_at_a_time.truncated is False
 
 
 # --- rg missing ---------------------------------------------------------------

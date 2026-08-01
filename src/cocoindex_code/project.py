@@ -441,6 +441,11 @@ class Project:
         version of what it added or modified — reusing the same branch
         resolution the semantic branch search uses.
 
+        Runs under the memory governor's scan gate, with the scan budget it
+        sized for this container — so a burst of greps is bounded the same way
+        the indexing fan-out is, and a branch scan reads the branch's files in
+        batches rather than all at once.
+
         Raises ``RuntimeError`` if ``rg`` isn't installed or the branch can't be
         resolved.
         """
@@ -467,20 +472,26 @@ class Project:
                     base_ref=base_ref, branch_ref=branch
                 )
 
-        # rg and the blob reads are blocking, so the whole scan runs off the loop.
-        if view is None:
-            outcome = await asyncio.to_thread(
-                ripgrep.search_tree, self._project_root, query
-            )
-        else:
-            outcome = await asyncio.to_thread(
-                ripgrep.search_branch,
-                self._project_root,
-                query,
-                branch_sha=view.sha,
-                branch_paths=view.branch_paths,
-                shadow_paths=view.shadow_paths,
-            )
+        governor = self._env.get_context(MEMORY_GOVERNOR)
+        budget = governor.scan_budget
+
+        # rg and the blob reads are blocking, so the whole scan runs off the
+        # loop — inside the scan gate, which bounds how many are in flight.
+        async with governor.scan_slot():
+            if view is None:
+                outcome = await asyncio.to_thread(
+                    ripgrep.search_tree, self._project_root, query, budget=budget
+                )
+            else:
+                outcome = await asyncio.to_thread(
+                    ripgrep.search_branch,
+                    self._project_root,
+                    query,
+                    branch_sha=view.sha,
+                    branch_paths=view.branch_paths,
+                    shadow_paths=view.shadow_paths,
+                    budget=budget,
+                )
         if outcome is None:
             raise RuntimeError(
                 "ripgrep (rg) is not available on the server — install it "

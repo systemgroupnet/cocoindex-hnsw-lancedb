@@ -17,7 +17,7 @@ Everything below is what this fork adds or emphasizes on top of upstream's seman
 - **Branch search.** Search *arbitrary git branches* — not just the checked-out one — via on-the-fly diff overlays, with a lexical fallback for very divergent branches. See [Branch search](#branch-search).
 - **`ripgrep` MCP tool.** Exact text/regex search alongside semantic search, branch-aware and index-free. See the [MCP tool reference](#coding-agent-integration-mcp).
 - **LanceDB + HNSW backend** with automatic disk compaction and recovery tooling. See [Vector search backend](#vector-search-backend-lancedb--hnsw).
-- **Container-aware memory governor** that sizes indexing concurrency to the cgroup limit and throttles under pressure. See [Limiting memory](#limiting-memory).
+- **Container-aware memory governor** that sizes indexing concurrency to the cgroup limit, bounds concurrent text scans, and throttles both under pressure. See [Limiting memory](#limiting-memory).
 - **Scheduled maintenance & git sync** — a daily `git pull → index → push metrics → evict overlays` workflow, built for repos kept as read-only mirrors. See [Scheduled maintenance & git sync](#scheduled-maintenance--git-sync).
 - **DevLake metrics push** — optional index-stats snapshots to MySQL.
 
@@ -139,7 +139,7 @@ ripgrep(
 
 Returns matches with `file_path`, `line_number`, `content` (the matching line, widened to the context window when `context_lines` is set), `start_line`/`end_line`, and a `truncated` flag telling you whether more matches exist beyond `limit`.
 
-Use `ripgrep` when you know the literal text — a symbol name, an error string, a config key — and `search` when you're looking for code by meaning. It reads the working tree directly, so it needs no index (and never triggers one), and it finds matches in files the index skips. It honors the repo's `.gitignore` and skips `.git` and `.cocoindex_code`. Requires the `rg` binary on the server (included in the Docker image).
+Use `ripgrep` when you know the literal text — a symbol name, an error string, a config key — and `search` when you're looking for code by meaning. It reads the working tree directly, so it needs no index (and never triggers one), and it finds matches in files the index skips. It honors the repo's `.gitignore` and skips `.git` and `.cocoindex_code`. Files over 16 MB are skipped and very long lines are cut (marked with `…`) — see [Limiting memory](#limiting-memory). Requires the `rg` binary on the server (included in the Docker image).
 
 With `branch` set, it searches that ref's view of the tree using the same decomposition as [branch search](#branch-search): the base checkout minus the files the branch touched, plus the branch's own version of the files it added or modified — read from git, never checked out.
 </details>
@@ -201,6 +201,8 @@ ccc grep --branch feature/login 'session_token'      # grep a git branch (see Br
 
 It reads the working tree directly, so it needs **no index** — it works before the first index pass, never triggers one, and finds matches in files the index skips. It honors the repo's `.gitignore` and skips `.git` and `.cocoindex_code`. Output is the familiar `file:line: text` (with `-C`, each context line is numbered and the matching line marked `>`). If more matches exist than `--limit`, a note goes to stderr so piped output stays clean.
 
+Two bounds apply to every scan, so one query can't blow the daemon's memory budget: files over 16 MB aren't searched, and a line longer than 2000 characters is cut at that point and marked with `…`. See [Limiting memory](#limiting-memory).
+
 Requires the `rg` binary on the machine running the daemon — included in the Docker image; on a source checkout install it yourself (`apt-get install ripgrep`, `brew install ripgrep`, `winget install BurntSushi.ripgrep.MSVC`).
 
 ## Branch search
@@ -214,6 +216,8 @@ The index is built from the **checked-out working tree** — normally the branch
 Overlays are cached per commit SHA (a new commit invalidates the old one) and evicted when not searched within `COCOINDEX_CODE_BRANCH_OVERLAY_TTL_DAYS`.
 
 **`grep` is branch-aware too.** `ccc grep --branch` (and the `ripgrep` MCP tool's `branch`) resolves the ref through exactly the same path, then applies the same decomposition to a text scan: the base working tree minus the files the branch touched, plus rg over the branch's own version of the files it added or modified. No overlay table, no embedding, no index — so it's the cheap way to look at a branch, and the two tools can never disagree about what "the branch" contains.
+
+Unlike semantic branch search, grep has no divergence gate — there's no embedding cost to avoid, so `COCOINDEX_CODE_BRANCH_MAX_CHANGED_FILES` doesn't apply. Instead the branch's files are read in memory-budgeted batches (see [Limiting memory](#limiting-memory)), so an arbitrarily divergent branch costs more passes, not more RAM.
 
 ```bash
 ccc search --branch feature/login "session handling"
@@ -355,6 +359,27 @@ Indexing is memory-hungry: the engine keeps many files in flight at once (each h
 
 The daemon **detects the container's memory limit and sizes itself to fit**: it reads the cgroup limit at startup, caps how many files it indexes concurrently so the working set stays within budget, and throttles that concurrency further in real time as usage approaches the limit. So you just set a limit the normal Docker way — no app-specific configuration required.
 
+**Text scans are governed too.** `ccc grep` / the `ripgrep` MCP tool spawn `rg` subprocesses, which are charged to the same cgroup as everything else. Three bounds keep them inside it:
+
+- **At most 4 scans run at once** (a worker pool, like any connection pool). Further requests queue rather than forking more processes.
+- **Files over 16 MB aren't searched**, and match lines are cut at 2000 characters. One checked-in dump or minified bundle would otherwise be buffered whole.
+- **A branch scan reads the branch's changed files in batches**, sized from the memory limit, instead of loading all of them at once. Grepping a branch that rewrote 5,000 files costs one batch of resident text, not 5,000 files — it just takes more passes.
+
+Under hard memory pressure the live monitor halves scan concurrency alongside the indexing gate; under soft pressure only indexing eases off, so an interactive grep still gets served.
+
+**Excess requests queue — they are never rejected.** A scan past the pool size waits for a permit and is then served; nothing is dropped, errored, or killed. A waiting request costs almost nothing (it holds no `rg` process, no worker thread, no file handles — the permit is taken *before* any of that is allocated), so the queue is cheap but it does add latency. Watch it with:
+
+```bash
+docker exec cocoindex-code ccc doctor   # "Memory" check
+```
+
+```
+Text scan queue: 4 running, 7 queued (peak queued: 12)
+Scans delayed over 2s: 9 (longest wait: 6.4s). Raise COCOINDEX_CODE_MAX_CONCURRENT_SCANS if there's memory headroom.
+```
+
+Any scan that waits more than 2 seconds is also logged with the current queue state. A rising delayed count means the pool is your bottleneck, not a hang — raise `COCOINDEX_CODE_MAX_CONCURRENT_SCANS` if the container has room. Note that clients apply their own tool-call timeouts: the daemon will keep a queued request forever, but an MCP client may give up on it first.
+
 **Docker Compose** — set `COCOINDEX_MEM_LIMIT` (the bundled compose file wires it into `mem_limit` / `memswap_limit`, defaulting to `2g`):
 
 ```bash
@@ -382,11 +407,17 @@ docker exec cocoindex-code ccc doctor   # see the "Memory" check
 
 # Pin the max concurrent in-flight files, bypassing the auto heuristic:
 -e COCOINDEX_CODE_MAX_INFLIGHT_FILES=32
+
+# Pin how many `rg` scans may run at once (default 4). Raise it if many agents
+# grep concurrently and you have the headroom; lower it in a tight container:
+-e COCOINDEX_CODE_MAX_CONCURRENT_SCANS=2
 ```
+
+> **What's sized vs. what's fixed.** The indexing fan-out and the branch-scan batch size are derived from the detected limit. Scan concurrency and the 16 MB file cut are *fixed policy* — deliberately, because no one has measured what one `rg` process costs on your workload, and a made-up per-scan byte estimate would look more precise than it is. Both are overridable, and `ccc doctor` prints what's in effect.
 
 The images also set `MALLOC_ARENA_MAX=2` to keep native (torch / Arrow / Lance) allocations from fragmenting resident memory upward over time. If you need to squeeze RSS further, preloading a `jemalloc`/`tcmalloc` allocator via `LD_PRELOAD` is the next lever.
 
-> If no memory limit is detected (e.g. an unconstrained container or a non-Linux host), indexing falls back to the engine default with no runtime throttling — `ccc doctor` flags this so you can set `COCOINDEX_CODE_MEMORY_LIMIT_MB` to re-enable the guard.
+> If no memory limit is detected (e.g. an unconstrained container or a non-Linux host), indexing falls back to the engine default with no runtime throttling, and text scans use fixed defaults rather than a sized budget — they stay bounded, just not fitted to anything. `ccc doctor` flags this so you can set `COCOINDEX_CODE_MEMORY_LIMIT_MB` to re-enable the guard.
 
 ### Scheduled maintenance & git sync
 
