@@ -922,9 +922,21 @@ def _start_mcp_http_server(
     import contextlib
     from collections.abc import Iterator
 
-    import uvicorn
+    try:
+        import uvicorn
 
-    from .server import create_mcp_server
+        from .server import create_mcp_server
+    except ImportError:
+        # The HTTP endpoint is optional; the socket server is already listening
+        # and serves the CLI, stdio MCP, indexing and the scheduled workflow.
+        # Letting an import error escape here takes all of that down and puts a
+        # supervised container into a crash loop — degrade loudly instead.
+        logger.exception(
+            "MCP HTTP server unavailable: its dependencies failed to import. "
+            "The daemon continues without it; the socket server and CLI are "
+            "unaffected. Set COCOINDEX_CODE_MCP_DISABLE=1 to silence this."
+        )
+        return
 
     class _NoSignalServer(uvicorn.Server):
         """uvicorn server that leaves SIGTERM/SIGINT to the daemon.
@@ -986,22 +998,27 @@ def _start_mcp_http_server(
             ),
         )
 
-    mcp = create_mcp_server(
-        project_root,
-        search_backend=_backend,
-        ripgrep_backend=_rg_backend,
-        transport_security=_mcp_transport_security(),
-    )
-    config = uvicorn.Config(
-        mcp.streamable_http_app(),
-        host=host,
-        port=port,
-        log_level="info",
-        access_log=False,
-    )
-    server = _NoSignalServer(config)
+    try:
+        mcp = create_mcp_server(
+            project_root,
+            search_backend=_backend,
+            ripgrep_backend=_rg_backend,
+            transport_security=_mcp_transport_security(),
+        )
+        config = uvicorn.Config(
+            mcp.streamable_http_app(),
+            host=host,
+            port=port,
+            log_level="info",
+            access_log=False,
+        )
+        task = loop.create_task(_NoSignalServer(config).serve())
+    except Exception:
+        # Same reasoning as the import guard above: an incompatible MCP SDK
+        # version fails here rather than at import, and must not be fatal.
+        logger.exception("MCP HTTP server failed to start; the daemon continues without it")
+        return
 
-    task = loop.create_task(server.serve())
     tasks.add(task)
     task.add_done_callback(tasks.discard)
     logger.info(

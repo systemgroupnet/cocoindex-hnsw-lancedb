@@ -417,3 +417,36 @@ def test_mcp_transport_security_wildcard_disables_protection(
     mw = TransportSecurityMiddleware(ts)
     req = Request({"type": "http", "method": "GET", "headers": [(b"host", b"anything.example.com")]})
     assert asyncio.run(mw.validate_request(req)) is None
+
+
+def test_mcp_http_server_import_failure_does_not_stop_the_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The HTTP endpoint is optional; its dependencies failing must not be fatal.
+
+    An incompatible MCP SDK (e.g. 2.x, which dropped `mcp.server.fastmcp`) used
+    to raise straight out of daemon startup, taking down the socket server, the
+    CLI and the scheduled workflow with it — and, under a supervisor, crash-
+    looping the container.
+    """
+    import asyncio
+    import sys
+
+    from cocoindex_code.daemon import ProjectRegistry, _start_mcp_http_server
+    from cocoindex_code.memory import ENGINE_DEFAULT_MAX_INFLIGHT, MemoryGovernor
+
+    monkeypatch.setenv("COCOINDEX_CODE_MCP_PORT", "8001")
+    monkeypatch.delenv("COCOINDEX_CODE_MCP_DISABLE", raising=False)
+    # A None entry in sys.modules makes `import cocoindex_code.server` raise
+    # ImportError — the same shape as the missing-submodule failure.
+    monkeypatch.setitem(sys.modules, "cocoindex_code.server", None)
+
+    governor = MemoryGovernor(None, "test", ENGINE_DEFAULT_MAX_INFLIGHT)
+    registry = ProjectRegistry(None, governor=governor)
+    loop = asyncio.new_event_loop()
+    try:
+        tasks: set[asyncio.Task[None]] = set()
+        _start_mcp_http_server(loop, registry, tasks)  # must return, not raise
+        assert tasks == set()  # nothing scheduled, daemon carries on
+    finally:
+        loop.close()
