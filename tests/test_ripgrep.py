@@ -149,7 +149,7 @@ def test_search_tree_limit_marks_truncated(tmp_path: Path) -> None:
 
 @_needs_rg
 def test_search_tree_skips_the_index_dir_but_searches_hidden_files(tmp_path: Path) -> None:
-    _write(tmp_path, f"{SETTINGS_DIR_NAME}/overlays.json", '{"needle": 1}\n')
+    _write(tmp_path, f"{SETTINGS_DIR_NAME}/settings.yml", "needle: 1\n")
     _write(tmp_path, ".github/workflows/ci.yml", "run: needle\n")
     _write(tmp_path, "src/a.py", "# needle\n")
 
@@ -341,7 +341,7 @@ def test_blob_batches_never_exceed_the_batch_budget(branch_repo: Path) -> None:
     sha = _out(branch_repo, "rev-parse", "feature")
     paths = ["added.py", "mod.py"]
     # Each file is ~16-18 bytes; a 20-byte budget forces one file per batch.
-    batches = list(ripgrep._blob_batches(branch_repo, sha, paths, _budget(blob_batch_bytes=20)))
+    batches = list(ripgrep.blob_batches(branch_repo, sha, paths, _budget(blob_batch_bytes=20)))
 
     assert len(batches) == 2  # not one dict holding both files
     for batch in batches:
@@ -368,7 +368,7 @@ def test_blob_batches_skip_oversized_files_without_reading_them(
     monkeypatch.setattr(ripgrep.git_ops, "read_blob", tracked_read)
 
     batches = list(
-        ripgrep._blob_batches(
+        ripgrep.blob_batches(
             branch_repo, sha, ["added.py", "mod.py"], _budget(max_filesize_bytes=1)
         )
     )

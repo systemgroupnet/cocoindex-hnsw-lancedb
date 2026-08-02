@@ -14,11 +14,11 @@ Everything below is what this fork adds or emphasizes on top of upstream's seman
 
 - **Long-running daemon.** A background service keeps the embedding model resident and the index open, so searches are fast and the model loads only once. Connections are handled concurrently.
 - **MCP server, stdio and HTTP.** Run `ccc mcp` for a stdio server, or expose a streamable-HTTP MCP endpoint from the daemon (`COCOINDEX_CODE_MCP_PORT`) that many clients share against one warm process.
-- **Branch search.** Search *arbitrary git branches* — not just the checked-out one — via on-the-fly diff overlays, with a lexical fallback for very divergent branches. See [Branch search](#branch-search).
+- **Branch search.** Search *arbitrary git branches* — not just the checked-out one — by combining the base index with a ripgrep scan of the branch's diff. Nothing per-branch is ever indexed or embedded. See [Branch search](#branch-search).
 - **`ripgrep` MCP tool.** Exact text/regex search alongside semantic search, branch-aware and index-free. See the [MCP tool reference](#coding-agent-integration-mcp).
 - **LanceDB + HNSW backend** with automatic disk compaction and recovery tooling. See [Vector search backend](#vector-search-backend-lancedb--hnsw).
 - **Container-aware memory governor** that sizes indexing concurrency to the cgroup limit, bounds concurrent text scans, and throttles both under pressure. See [Limiting memory](#limiting-memory).
-- **Scheduled maintenance & git sync** — a daily `git pull → index → push metrics → evict overlays` workflow, built for repos kept as read-only mirrors. See [Scheduled maintenance & git sync](#scheduled-maintenance--git-sync).
+- **Scheduled maintenance & git sync** — a daily `git pull → index → push metrics` workflow, built for repos kept as read-only mirrors. See [Scheduled maintenance & git sync](#scheduled-maintenance--git-sync).
 - **DevLake metrics push** — optional index-stats snapshots to MySQL.
 
 ## Install & run
@@ -207,17 +207,18 @@ Requires the `rg` binary on the machine running the daemon — included in the D
 
 ## Branch search
 
-The index is built from the **checked-out working tree** — normally the branch a deployment keeps reset to (the *base*). Branch search lets you query **any other git branch** without maintaining a full index per branch: it builds a small, ephemeral overlay from just the files the branch changed and merges it with the base index.
+The index is built from the **checked-out working tree** — normally the branch a deployment keeps reset to (the *base*). Branch search lets you query **any other git branch** without maintaining a full index per branch, and without indexing or embedding anything about that branch: it searches the base index with the branch's changed files hidden, then scans the branch's own version of those files with ripgrep.
 
 - **Omit `branch`** (or pass the base ref) → searches the base index, exactly as before, zero overhead.
-- **Low-divergence branch** → a semantic **overlay**: the branch's version of its added/modified files is embedded into an ephemeral `overlay_<sha>` table, and the search returns that overlay merged with the base index *minus the files the branch touched* (so you never get a stale base version of a modified file). All results are `source: "semantic"`.
-- **High-divergence branch** (over `COCOINDEX_CODE_BRANCH_MAX_CHANGED_FILES`) → a **lexical fallback**: semantic results over the base (minus the changed files) plus a keyword scan of the branch's changed files, returned as a distinct `source: "lexical"` section instead of embedding a huge diff.
+- **Any other ref** → two sections in one result set:
+  - `source: "semantic"` — vector search over the base index *minus the files the branch touched*, so a stale base version of a modified file never surfaces.
+  - `source: "lexical"` — a ripgrep scan of the branch's own version of the files it added or modified, ranked by how many of the query's terms each hit contains.
 
-Overlays are cached per commit SHA (a new commit invalidates the old one) and evicted when not searched within `COCOINDEX_CODE_BRANCH_OVERLAY_TTL_DAYS`.
+This is the same for every branch, however divergent. Nothing is embedded on the request path, so a branch search costs no model calls and leaves no per-branch state behind.
 
-**`grep` is branch-aware too.** `ccc grep --branch` (and the `ripgrep` MCP tool's `branch`) resolves the ref through exactly the same path, then applies the same decomposition to a text scan: the base working tree minus the files the branch touched, plus rg over the branch's own version of the files it added or modified. No overlay table, no embedding, no index — so it's the cheap way to look at a branch, and the two tools can never disagree about what "the branch" contains.
+**`grep` is branch-aware too.** `ccc grep --branch` (and the `ripgrep` MCP tool's `branch`) resolves the ref through exactly the same path and applies the same decomposition: the base working tree minus the files the branch touched, plus rg over the branch's own version of the files it added or modified. The difference from `search` is only what the base side does — a vector query there, a text scan here — so the two tools can never disagree about what "the branch" contains.
 
-Unlike semantic branch search, grep has no divergence gate — there's no embedding cost to avoid, so `COCOINDEX_CODE_BRANCH_MAX_CHANGED_FILES` doesn't apply. Instead the branch's files are read in memory-budgeted batches (see [Limiting memory](#limiting-memory)), so an arbitrarily divergent branch costs more passes, not more RAM.
+Both paths read the branch's files in memory-budgeted batches (see [Limiting memory](#limiting-memory)), so an arbitrarily divergent branch costs more passes, not more RAM. There is no cap on how many files a branch may change.
 
 ```bash
 ccc search --branch feature/login "session handling"
@@ -235,8 +236,6 @@ The one writer is the pre-search refresh above: it always updates `refs/remotes/
 | Env var | Default | Effect |
 |---|---|---|
 | `COCOINDEX_CODE_BASE_REF` | auto (`HEAD`) | The ref the base index represents / the diff base. Auto-detected from the checked-out branch; override when it differs. |
-| `COCOINDEX_CODE_BRANCH_MAX_CHANGED_FILES` | `50` | Above this many changed files, use the lexical fallback instead of a semantic overlay. |
-| `COCOINDEX_CODE_BRANCH_OVERLAY_TTL_DAYS` | `7` | Evict an overlay not searched within this many days. |
 | `COCOINDEX_CODE_BRANCH_FETCH_ENABLED` | on | Set falsy (`0`/`false`/`no`/`off`) to forbid the on-demand fetch, restricting search to refs already in the clone. |
 | `COCOINDEX_CODE_BRANCH_REFRESH_SECONDS` | `60` | Minimum seconds between pre-search clone refreshes; `0` refreshes on every search. |
 
@@ -426,7 +425,6 @@ The daemon runs one **daily maintenance workflow** that, for each target repo, d
 1. **git pull** — fetch and hard-reset the working tree to its upstream (opt-in; skipped for non-git directories),
 2. **index** — an incremental index pass over the refreshed tree,
 3. **push metrics** — write an index-stats snapshot to MySQL (only when the `COCOINDEX_CODE_METRICS_*` target is configured),
-4. **evict overlays** — drop branch-search overlays past their TTL (see [Branch search](#branch-search)).
 
 In the Docker image it targets the mounted repo (`/workspace`) at 03:00 local by default. Run steps on demand with `ccc pull` (step 1) and `ccc index` (step 2).
 
@@ -451,7 +449,7 @@ The two `GIT_` credentials are also used by [branch search](#branch-search)'s pr
 
 - **Semantic code search**: find relevant code using natural language queries when grep doesn't work well, and save tokens immediately.
 - **Long-running service**: a warm daemon serves the CLI and MCP (stdio + HTTP) with the model loaded once.
-- **Branch search**: query arbitrary git branches via ephemeral diff overlays (see [Branch search](#branch-search)).
+- **Branch search**: query arbitrary git branches with no per-branch index (see [Branch search](#branch-search)).
 - **Semantic *and* exact search**: `search` finds code by meaning; `ccc grep` / the `ripgrep` MCP tool finds literal text and regexes, index-free and branch-aware (see [Grep options](#grep-options)).
 - **Ultra performant**: ⚡ built on the [CocoIndex](https://github.com/cocoindex-io/cocoindex) Rust indexing engine. Only re-indexes changed files for fast updates.
 - **Multi-language support**: Python, JavaScript/TypeScript, Rust, Go, Java, C/C++, C#, SQL, Shell, and more (see [Supported languages](#supported-languages)).
@@ -794,7 +792,7 @@ Both source and target must be absolute paths. If no mapping matches, the defaul
 
 ## Vector search backend (LanceDB + HNSW)
 
-Chunk embeddings are stored in an embedded **[LanceDB](https://lancedb.github.io/lancedb/)** table (`lancedb/code_chunks.lance` under your index directory). LanceDB runs in-process — no separate server — so the tool stays zero-config, while supporting concurrent reads for the MCP server. Branch overlays are sibling `lancedb/overlay_<sha>.lance` tables (see [Branch search](#branch-search)).
+Chunk embeddings are stored in an embedded **[LanceDB](https://lancedb.github.io/lancedb/)** table (`lancedb/code_chunks.lance` under your index directory). LanceDB runs in-process — no separate server — so the tool stays zero-config, while supporting concurrent reads for the MCP server. It is the only table: branch search adds none.
 
 **Approximate nearest-neighbour (HNSW).** Once a codebase grows past a few hundred chunks, the embedding column is indexed with an **HNSW graph using cosine distance**. HNSW makes query latency *sublinear* in codebase size, versus an exact brute-force scan that grows linearly. The index is built automatically after indexing and maintained incrementally on subsequent updates.
 

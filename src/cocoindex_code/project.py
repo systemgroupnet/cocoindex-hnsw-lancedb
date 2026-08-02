@@ -13,7 +13,7 @@ import cocoindex as coco
 from cocoindex.connectors import lancedb as coco_lancedb
 
 from . import git_ops, ripgrep
-from .branch_overlay import BranchOverlayManager, BranchView
+from .branch_search import BranchSearch, BranchView, drop_legacy_overlays
 from .chunking import CHUNKER_REGISTRY, ChunkerFn
 from .indexer import indexer_main
 from . import metrics
@@ -75,7 +75,7 @@ class Project:
     _env: coco.Environment
     _app: coco.App[[], None]
     _project_root: Path
-    _overlays: BranchOverlayManager
+    _branches: BranchSearch
     _index_lock: asyncio.Lock
     _initial_index_done: asyncio.Event
     # Set synchronously the moment an index task is created (before it acquires
@@ -382,10 +382,10 @@ class Project:
         """Search within this project.
 
         When *branch* is set and differs from the base ref, the search runs
-        against a branch overlay (base index minus the branch's touched files,
-        plus that ref's version of them) instead of the base index. Raises
-        ``RuntimeError`` if the base ref can't be determined or the branch can't
-        be resolved locally.
+        against that branch: semantic results over the base index with the
+        branch's touched files hidden, plus a ripgrep scan of that ref's version
+        of them. Raises ``RuntimeError`` if the base ref can't be determined or
+        the branch can't be resolved locally.
         """
         branch = branch.strip() if branch else None
         if branch:
@@ -396,7 +396,7 @@ class Project:
                     "(not a git repo or detached HEAD; set COCOINDEX_CODE_BASE_REF)"
                 )
             if branch != base_ref:
-                return await self._overlays.search(
+                return await self._branches.search(
                     query=query, base_ref=base_ref, branch_ref=branch,
                     languages=languages, paths=paths, limit=limit, offset=offset,
                 )
@@ -468,7 +468,7 @@ class Project:
                     "(not a git repo or detached HEAD; set COCOINDEX_CODE_BASE_REF)"
                 )
             if branch != base_ref:
-                view = await self._overlays.resolve_branch(
+                view = await self._branches.resolve_branch(
                     base_ref=base_ref, branch_ref=branch
                 )
 
@@ -498,10 +498,6 @@ class Project:
                 "(e.g. `apt-get install ripgrep`) to use this tool"
             )
         return outcome
-
-    async def evict_stale_overlays(self) -> None:
-        """Drop branch overlays past their TTL (delegates to the overlay manager)."""
-        await self._overlays.evict_stale()
 
     # ------------------------------------------------------------------
     # Status
@@ -712,11 +708,17 @@ class Project:
             indexer_main,
         )
 
+        # One-time cleanup of the removed semantic-overlay path. Done here
+        # rather than at daemon startup because the daemon doesn't know which
+        # projects exist until one is requested, and this is the point where
+        # that project's LanceDB connection is open.
+        await drop_legacy_overlays(env, project_root)
+
         result = Project.__new__(Project)
         result._env = env
         result._app = app
         result._project_root = project_root
-        result._overlays = BranchOverlayManager(env, project_root)
+        result._branches = BranchSearch(env, project_root)
         result._index_lock = asyncio.Lock()
         result._initial_index_done = asyncio.Event()
         result._indexing_scheduled = False

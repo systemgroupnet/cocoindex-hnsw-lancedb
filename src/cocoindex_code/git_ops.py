@@ -76,18 +76,14 @@ class BranchDiff:
     deleted: tuple[str, ...]
 
     @property
-    def to_embed(self) -> tuple[str, ...]:
-        """Files whose branch content should be chunked into the overlay."""
+    def to_scan(self) -> tuple[str, ...]:
+        """Files whose branch content should be read and searched."""
         return self.added + self.modified
 
     @property
     def shadow(self) -> tuple[str, ...]:
         """Base-index paths to hide (branch modified or deleted them)."""
         return self.modified + self.deleted
-
-    @property
-    def total_changed(self) -> int:
-        return len(self.added) + len(self.modified) + len(self.deleted)
 
 
 @dataclass(frozen=True)

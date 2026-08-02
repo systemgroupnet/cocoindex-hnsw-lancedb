@@ -21,10 +21,11 @@ import numpy as np
 import pytest
 from cocoindex.resources.schema import VectorSchema
 
+from cocoindex_code.lancedb_store import TABLE_NAME
 from cocoindex_code.project import Project
 from cocoindex_code.protocol import IndexingProgress
 from cocoindex_code.query import _build_filter, _glob_to_like
-from cocoindex_code.settings import ProjectSettings, save_project_settings
+from cocoindex_code.settings import ProjectSettings, lancedb_dir_path, save_project_settings
 
 # ---------------------------------------------------------------------------
 # Unit tests: GLOB -> LIKE translation
@@ -245,7 +246,7 @@ async def test_pagination_offset_skips_results(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Branch search: overlay on a real git repo (deterministic keyword embedder)
+# Branch search: base index + ripgrep over the diff (deterministic embedder)
 # ---------------------------------------------------------------------------
 
 _needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
@@ -277,18 +278,25 @@ def _make_branch_repo(root: Path) -> None:
 
 
 @_needs_git
-async def test_branch_overlay_returns_branch_version(tmp_path: Path) -> None:
-    """A branch search surfaces the branch's version of a modified file."""
+async def test_branch_search_returns_branch_version(tmp_path: Path) -> None:
+    """A branch search surfaces the branch's version of a modified file.
+
+    It arrives in the `lexical` section: the diff is scanned with ripgrep, never
+    embedded, so nothing about the branch reaches the vector index.
+    """
     _make_branch_repo(tmp_path)
     project = await _make_project(tmp_path)
     await project.run_index()  # indexes 'main' (the base)
 
-    # On the base, 'gamma' matches nothing strongly; on 'feature', a.py is gamma.
+    # On the base, 'gamma' exists nowhere; on 'feature', a.py is gamma.
     results = await project.search("gamma", limit=5, branch="feature")
-    assert results
-    assert results[0].file_path == "a.py"
-    assert results[0].source == "semantic"
-    assert "gamma" in results[0].content
+    hits = [r for r in results if r.file_path == "a.py"]
+    assert hits, "the branch's version of a.py was not returned"
+    assert hits[0].source == "lexical"
+    assert "gamma" in hits[0].content
+    # Nothing from the branch is ever embedded, so no result for a branch-only
+    # file may claim to be semantic.
+    assert all(r.source == "lexical" for r in results if r.file_path in {"a.py", "c.py"})
     project.close()
 
 
@@ -305,6 +313,36 @@ async def test_branch_search_shadows_stale_base_file(tmp_path: Path) -> None:
     for r in results:
         if r.file_path == "a.py":
             assert "alpha" not in r.content, "stale base version of a.py leaked into branch search"
+    project.close()
+
+
+async def test_opening_a_project_drops_obsolete_overlay_tables(tmp_path: Path) -> None:
+    """Upgrade path: the removed overlay feature left tables behind.
+
+    They were evicted only on a TTL, so a deployment can be carrying a week of
+    them. Nothing reads them now, so opening the project reclaims the space.
+    """
+    from cocoindex_code.branch_search import drop_legacy_overlays
+    from cocoindex_code.shared import LANCE_DB
+
+    _write(tmp_path, "a.py", "alpha\n")
+    project = await _make_project(tmp_path)
+    await project.run_index()  # creates the base table the cleanup must spare
+    conn = project._env.get_context(LANCE_DB)
+    await conn.create_table("overlay_deadbeef12", data=[{"id": 1, "content": "stale"}])
+    sidecar = lancedb_dir_path(tmp_path) / "overlays.json"
+    sidecar.write_text('{"overlays": {"overlay_deadbeef12": {}}}')
+    assert "overlay_deadbeef12" in (await conn.list_tables()).tables
+
+    # Called by Project.create on open; invoked directly here because only one
+    # CocoIndex environment may be open per process, so the project can't be
+    # reopened inside a test.
+    await drop_legacy_overlays(project._env, tmp_path)
+
+    tables = (await conn.list_tables()).tables
+    assert "overlay_deadbeef12" not in tables
+    assert TABLE_NAME in tables, "cleanup must only touch overlay_* tables"
+    assert not sidecar.exists()
     project.close()
 
 
@@ -345,9 +383,8 @@ async def test_branch_search_finds_remote_tracking_branch(tmp_path: Path) -> Non
     await project.run_index()  # indexes 'main' (the base)
 
     results = await project.search("gamma", limit=5, branch="feature")
-    assert results
-    assert results[0].file_path == "a.py"
-    assert "gamma" in results[0].content
+    hits = [r for r in results if r.file_path == "a.py"]
+    assert hits and "gamma" in hits[0].content
     # The working tree stayed on the base throughout.
     assert (clone / "a.py").read_text() == "alpha alpha alpha\n"
     project.close()
@@ -396,7 +433,7 @@ async def test_ripgrep_on_a_branch_sees_the_branch_version(tmp_path: Path) -> No
 
 @_needs_git
 async def test_branch_equal_to_base_is_plain_search(tmp_path: Path) -> None:
-    """Passing the base ref as the branch is a normal base search (no overlay)."""
+    """Passing the base ref as the branch is a normal base search (no diff scan)."""
     _make_branch_repo(tmp_path)
     project = await _make_project(tmp_path)
     await project.run_index()

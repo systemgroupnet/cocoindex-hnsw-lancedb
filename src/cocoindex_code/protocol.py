@@ -25,8 +25,8 @@ class SearchRequest(_msgspec.Struct, tag="search"):
     limit: int = 5
     offset: int = 0
     # Git branch/ref to search. None (or the base ref) searches the base index —
-    # the default, zero-overhead path. Any other ref triggers a branch overlay
-    # (or lexical fallback) built from that ref's diff against the base.
+    # the default, zero-overhead path. Any other ref searches the base minus the
+    # files that ref changed, plus a ripgrep scan of its version of them.
     branch: str | None = None
     # Incrementally refresh the index before searching. Honored only when no
     # index pass is already running; if one is (e.g. an explicit `ccc index`),
@@ -158,9 +158,9 @@ class SearchResult(_msgspec.Struct):
     start_line: int
     end_line: int
     score: float
-    # Which search produced this row: "semantic" (vector search over the base or
-    # a branch overlay) or "lexical" (keyword scan of a high-divergence branch's
-    # changed files). Lets a client render the two branch-search sections.
+    # Which search produced this row: "semantic" (vector search over the base
+    # index) or "lexical" (ripgrep scan of a branch's changed files). Lets a
+    # client render the two branch-search sections.
     source: str = "semantic"
 
 

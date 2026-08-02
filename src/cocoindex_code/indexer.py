@@ -44,8 +44,7 @@ def chunk_file_content(
     """Detect language and split *content* into chunks.
 
     Single source of truth for how a file's text becomes chunks + a language
-    label, shared by :func:`process_file` (the on-disk indexer) and the branch
-    overlay builder (which feeds git blob content). *language_overrides* maps a
+    label for :func:`process_file`, the on-disk indexer. *language_overrides* maps a
     dotted suffix (e.g. ``".vue"``) to a language, and *chunker_registry* maps a
     dotted suffix to a custom :data:`ChunkerFn`; both come from project settings.
 

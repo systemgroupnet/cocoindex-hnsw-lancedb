@@ -1067,7 +1067,7 @@ async def _scheduled_target_projects(
 async def _run_scheduled_workflow_for(
     project: Project, config: schedule.ScheduleConfig
 ) -> None:
-    """Run git pull -> index -> push metrics -> evict stale overlays for one project.
+    """Run git pull -> index -> push metrics for one project.
 
     Every step is best-effort and independently guarded: a failure is logged and
     the next step still runs, so a broken remote never blocks indexing and a
@@ -1103,12 +1103,6 @@ async def _run_scheduled_workflow_for(
         logger.info("Scheduled metrics push for %s: %s", root, resp.message)
     except Exception:
         logger.exception("Scheduled metrics push failed for %s", root)
-
-    # Step 4: reclaim branch overlays past their TTL (no-op when none are stale).
-    try:
-        await project.evict_stale_overlays()
-    except Exception:
-        logger.exception("Scheduled overlay eviction failed for %s", root)
 
 
 async def _run_scheduled_workflow(

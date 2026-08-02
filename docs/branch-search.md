@@ -18,8 +18,18 @@ usually small. Branch search exploits that.
 
 ## Model
 
-There is one persistent index — the **base** — plus small, ephemeral
-**overlays**, one per branch commit.
+There is exactly one index — the **base**. Nothing per-branch is indexed,
+embedded, or persisted: a branch's changed files are read out of the object
+database and scanned with ripgrep on the request path.
+
+> **Removed: semantic overlays.** Earlier versions embedded a branch's changed
+> files into an ephemeral `overlay_<sha>` LanceDB table when the diff was under
+> a threshold, falling back to a lexical scan above it. That path is gone. It
+> embedded on the request path (model calls inside a search), it created a table
+> per branch *commit* that was only evicted after a 7-day TTL, and it held every
+> changed file's chunks and vectors in memory at once while building. The
+> lexical path it used to fall back to is now the only path, for every branch.
+> `drop_legacy_overlays` removes the tables left behind, on first open.
 
 ### Base ref
 
@@ -49,33 +59,20 @@ base chunks
 ```
 
 The shadow set is exactly `git diff --name-status <merge-base>..X`. It drives
-**both** what the overlay embeds (added + modified) *and* what is hidden from
-the base index (modified + deleted). Skipping the subtraction returns stale base
+**both** what is scanned from the branch (added + modified) *and* what is hidden
+from the base index (modified + deleted). Skipping the subtraction returns stale base
 content for every modified file at a misleadingly high score — that omission is
 the single most important correctness point.
 
 ## Storage layout
 
-Overlays live in the project's LanceDB directory alongside the base table:
-
 ```
 .cocoindex_code/lancedb/
-  code_chunks.lance/            # the base index
-  overlay_<sha12>.lance/        # one per indexed branch commit
-  overlays.json                 # sidecar: table -> {branch, sha, last_access, created}
+  code_chunks.lance/            # the base index - the only table
 ```
 
-An overlay table has the **same physical schema** as `code_chunks`
-(`id, file_path, language, content, start_line, end_line, embedding`) so the
-existing query path reads it unchanged. Overlays are small, so they stay below
-`INDEX_MIN_ROWS` and use LanceDB's exact flat scan — no HNSW build needed.
-
-Overlay rows are embedded with the **indexing** embedder and
-`INDEXING_EMBED_PARAMS` (not the query embedder), so their vectors are
-"passage"-style and directly comparable to base rows. (Trade-off: a first-time
-overlay build can briefly serialize behind an in-flight index pass on the
-indexing embedder's lock. Overlays are cached, so this is a one-time cost per
-branch commit.)
+Branch search writes nothing. The branch side is read from git and scanned in
+memory, one memory-budgeted batch at a time.
 
 ## Pre-search refresh
 
@@ -147,40 +144,45 @@ Caller-supplied refs are rejected before reaching a command line if they could b
 read as a git option (leading `-`) or contain whitespace; a ref that will be
 fetched must additionally look like a plain branch name.
 
-## Query paths
+## Query path
 
-A branch's divergence from the base decides the path, gated by
-`COCOINDEX_CODE_BRANCH_MAX_CHANGED_FILES` (default 50).
+One path, for every branch regardless of divergence.
 
-### Low divergence — semantic overlay
+### Steps
 
-1. Resolve `X` → commit SHA (see [Ref resolution](#ref-resolution)). The SHA is
-   the overlay cache key, so a new commit / force-push transparently invalidates
-   the old overlay, and every later git call addresses the branch by SHA.
-2. `git diff --name-status <merge-base>..X` → added/modified/deleted sets,
-   filtered by the same include/exclude/gitignore matchers the base indexer uses.
-3. Build (or reuse) `overlay_<sha>`: read each added/modified file via
-   `git show <sha>:<path>`, chunk it (shared `chunk_file_content`), embed, write.
-4. Query = two vector searches merged by cosine score:
-   - `overlay_<sha>` — unfiltered.
-   - `code_chunks` — `WHERE file_path NOT IN (<shadow set>)`.
-
-   Both use the same embedder + metric, so scores are directly comparable. All
-   results are one unified semantic ranking (`source = "semantic"`).
-
-### High divergence — lexical fallback
-
-When the changed-file count exceeds the threshold, embedding the diff is too
-expensive. Instead of rejecting the branch, serve **two labeled sections**:
-
-- **`source = "semantic"`** — `code_chunks` minus the shadow set (the base, with
-  the branch's touched files hidden).
-- **`source = "lexical"`** — a ripgrep (with in-process Python fallback when the
-  `rg` binary is absent) scan of the branch's version of the changed files.
+1. Resolve `X` to a commit SHA (see [Ref resolution](#ref-resolution)). Every
+   later git call addresses the branch by SHA, so a ref that exists only as
+   `refs/remotes/<remote>/<name>` still works.
+2. `git diff --name-status <merge-base>..X` gives the added/modified/deleted
+   sets, filtered by the same include/exclude/gitignore matchers the base
+   indexer uses.
+3. Serve **two labeled sections**:
+   - **`source = "semantic"`** - `code_chunks` with
+     `WHERE file_path NOT IN (<shadow set>)`: the base, with the branch's
+     touched files hidden.
+   - **`source = "lexical"`** - a ripgrep scan (with an in-process Python
+     fallback when the `rg` binary is absent) of the branch's version of the
+     files it added or modified.
 
 Lexical hits carry no cosine score, so they are a separate section rather than
 being merged into the semantic ranking with a fabricated score. Each result
 carries its `source` so the caller/agent knows which is which.
+
+### Bounding the diff scan
+
+There is no cap on how many files a branch may change, so the scan is bounded by
+memory rather than by file count. `ripgrep.blob_batches` reads the changed files
+from git in batches that stay inside the memory governor's
+`ScanBudget.blob_batch_bytes`, skipping any single blob over
+`max_filesize_bytes` before it is read (sizes come from one `git cat-file`
+pass). Each batch is scored and only the running top-`limit` is kept.
+
+That batching is exact, not an approximation: a lexical hit's score is the
+fraction of query terms present in its own snippet, independent of every other
+hit, so merging per-batch winners yields the same ranking as scoring the whole
+diff at once. The whole scan holds one text-scan permit from the governor
+(`scan_slot`), the same gate the `ripgrep` tool uses - a branch search spawns rg
+exactly like a grep does.
 
 ## MCP surface
 
@@ -195,25 +197,21 @@ Each result gains a `source` field (`"semantic"` | `"lexical"`, default
 render the two sections.
 
 The `ripgrep` tool takes the same `branch` parameter and resolves it through the
-same path (`BranchOverlayManager.resolve_branch`: refresh → resolve → diff →
-filter), then applies the same decomposition to a text scan — the base working
-tree minus the shadow set, plus rg over the branch's version of the files it
-changed. No overlay table is involved, and no index is needed.
+same path (`BranchSearch.resolve_branch`: refresh → resolve → diff → filter),
+then applies the same decomposition to a text scan — the base working tree minus
+the shadow set, plus rg over the branch's version of the files it changed. The
+only difference from `search` is what the base side does: a vector query there,
+a text scan here. No index is needed either way.
 
 ## Eviction
 
-Overlays are disk. Each is dropped when it hasn't been *searched* within
-`COCOINDEX_CODE_BRANCH_OVERLAY_TTL_DAYS` (default 7). Last-access is tracked in
-the `overlays.json` sidecar. A sweep runs lazily on each branch search and again
-in the daily maintenance workflow. Eviction is a `drop_table` + sidecar prune.
+Nothing to evict. Branch search creates no per-branch state.
 
 ## Environment variables
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `COCOINDEX_CODE_BASE_REF` | auto (`HEAD`) | Ref the base index represents / diff base. |
-| `COCOINDEX_CODE_BRANCH_MAX_CHANGED_FILES` | `50` | Above this, use the lexical fallback instead of a semantic overlay. |
-| `COCOINDEX_CODE_BRANCH_OVERLAY_TTL_DAYS` | `7` | Evict an overlay not searched within this many days. |
 | `COCOINDEX_CODE_BRANCH_FETCH_ENABLED` | on | Set falsy to forbid the on-demand fetch, restricting search to refs already in the clone. |
 | `COCOINDEX_CODE_BRANCH_REFRESH_SECONDS` | `60` | Minimum seconds between pre-search refreshes; `0` refreshes on every search. |
 | `COCOINDEX_CODE_GIT_PULL_ENABLED` | off | When on, the pre-search refresh is a full pull (`reset --hard`) instead of a fetch. |

@@ -1,8 +1,8 @@
 """Lexical (keyword) search over a set of in-memory files.
 
-Used by the branch-search high-divergence path: when a branch changed too many
-files to embed into a semantic overlay, its changed files are searched
-lexically instead and returned as a separate ``source="lexical"`` section.
+Used by branch search for the diff side: the branch's own version of the files
+it added or modified is searched here and returned as a distinct
+``source="lexical"`` section alongside semantic results from the base index.
 
 Prefers the ``rg`` (ripgrep) binary to locate candidate lines when it is on
 ``PATH`` (via :mod:`cocoindex_code.ripgrep`); otherwise falls back to an
@@ -19,6 +19,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from . import ripgrep
+from .memory import DEFAULT_SCAN_BUDGET, ScanBudget
 
 # Query tokenization: alphanumeric/underscore runs, lowercased. Very short and
 # ultra-common tokens carry no signal for code search and would match nearly
@@ -79,6 +80,7 @@ def lexical_search(
     query: str,
     *,
     limit: int,
+    budget: ScanBudget = DEFAULT_SCAN_BUDGET,
 ) -> list[LexicalHit]:
     """Return up to *limit* lexical matches for *query* across *files*.
 
@@ -86,6 +88,10 @@ def lexical_search(
     is scored by the fraction of distinct query terms present in its context
     window, so a line hitting more of the query ranks higher; ties break by file
     path then line number for stable output.
+
+    Scores depend only on the hit's own snippet, never on the rest of the
+    corpus, so callers may split a large file set into batches and merge the
+    per-batch winners without changing the ranking.
     """
     file_list = list(files)
     terms = extract_terms(query)
@@ -93,7 +99,7 @@ def lexical_search(
         return []
 
     by_path = {f.path: f for f in file_list}
-    candidates = _rg_candidate_lines(file_list, terms)
+    candidates = _rg_candidate_lines(file_list, terms, budget)
     if candidates is None:
         candidates = _py_candidate_lines(file_list, terms)
 
@@ -141,7 +147,7 @@ def _py_candidate_lines(
 
 
 def _rg_candidate_lines(
-    files: list[LexicalFile], terms: list[str]
+    files: list[LexicalFile], terms: list[str], budget: ScanBudget
 ) -> dict[str, set[int]] | None:
     """Find candidate lines with ripgrep, or ``None`` if rg is unusable.
 
@@ -153,6 +159,7 @@ def _rg_candidate_lines(
     outcome = ripgrep.search_blobs(
         {f.path: f.content for f in files},
         ripgrep.RipgrepQuery(patterns=tuple(terms), fixed_strings=True),
+        budget=budget,
     )
     if outcome is None:
         return None

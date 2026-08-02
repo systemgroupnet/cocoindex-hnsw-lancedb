@@ -9,9 +9,10 @@ unlaunchable, or killed by the timeout. That distinction (rather than "no
 matches") is what lets ``lexical`` fall back to its in-process scan and the MCP
 tool report an actionable message instead of a silently empty result.
 
-Searching a *branch* mirrors the branch-overlay model: the base working tree
-minus the files the branch touched, plus the branch's own version of the files
-it added or modified — read out of the object database, never checked out.
+Searching a *branch* uses the same decomposition as semantic branch search: the
+base working tree minus the files the branch touched, plus the branch's own
+version of the files it added or modified — read out of the object database,
+never checked out.
 
 Every scan is bounded by a :class:`~cocoindex_code.memory.ScanBudget`: how big
 a file it will look at, how many rg worker threads it may run, and how much
@@ -200,7 +201,7 @@ def search_branch(
     branch_matches: list[RipgrepMatch] = []
     truncated = tree.truncated
     remaining = query.limit
-    for batch in _blob_batches(root, branch_sha, branch_paths, budget):
+    for batch in blob_batches(root, branch_sha, branch_paths, budget):
         if remaining is not None and remaining <= 0:
             # Batches left unscanned may hold matches — say so rather than
             # implying the branch side is exhausted.
@@ -411,7 +412,7 @@ def _build_match(
     )
 
 
-def _blob_batches(
+def blob_batches(
     root: Path, sha: str, paths: Sequence[str], budget: ScanBudget
 ) -> Iterator[dict[str, str]]:
     """Read ``sha``'s version of *paths*, yielding batches within the budget.

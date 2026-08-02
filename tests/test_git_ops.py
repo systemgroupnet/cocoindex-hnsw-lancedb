@@ -288,9 +288,8 @@ def test_branch_diff_classifies_changes(repo: Path) -> None:
     assert diff.added == ("added.py",)
     assert diff.modified == ("mod.py",)
     assert diff.deleted == ("gone.py",)
-    assert set(diff.to_embed) == {"added.py", "mod.py"}
+    assert set(diff.to_scan) == {"added.py", "mod.py"}
     assert set(diff.shadow) == {"mod.py", "gone.py"}
-    assert diff.total_changed == 3
 
 
 def test_branch_diff_bad_ref_returns_none(repo: Path) -> None:

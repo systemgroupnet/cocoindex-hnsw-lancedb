@@ -1,7 +1,7 @@
 """Tests for the pre-search clone refresh that runs before every branch search.
 
 Two layers: the throttle/never-raises contract of
-``BranchOverlayManager._refresh_clone`` (no git, no env needed), and
+``BranchSearch._refresh_clone`` (no git, no env needed), and
 ``_refresh_clone_sync`` driven against a real temp clone to pin down what the
 pull gate actually does to the checkout.
 """
@@ -15,8 +15,8 @@ from typing import Any, cast
 
 import pytest
 
-from cocoindex_code import branch_overlay, git_ops, schedule
-from cocoindex_code.branch_overlay import BranchOverlayManager
+from cocoindex_code import branch_search, git_ops, schedule
+from cocoindex_code.branch_search import BranchSearch
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
 
@@ -51,17 +51,17 @@ def _out(root: Path, *args: str) -> str:
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         schedule.ENV_GIT_PULL_ENABLED,
-        branch_overlay.ENV_REFRESH_SECONDS,
+        branch_search.ENV_REFRESH_SECONDS,
         git_ops.ENV_GIT_USERNAME,
         git_ops.ENV_GIT_PASSWORD,
     ):
         monkeypatch.delenv(name, raising=False)
 
 
-def _manager(root: Path) -> BranchOverlayManager:
+def _manager(root: Path) -> BranchSearch:
     # _refresh_clone never touches the CocoIndex environment, so a placeholder
     # keeps these tests free of embedder/LanceDB setup.
-    return BranchOverlayManager(cast(Any, None), root)
+    return BranchSearch(cast(Any, None), root)
 
 
 # --- throttle + failure containment ------------------------------------------
@@ -79,7 +79,7 @@ async def test_refresh_is_throttled_within_the_interval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[Path] = []
-    monkeypatch.setattr(branch_overlay, "_refresh_clone_sync", _recording_refresh(calls))
+    monkeypatch.setattr(branch_search, "_refresh_clone_sync", _recording_refresh(calls))
     manager = _manager(tmp_path)
 
     for _ in range(3):
@@ -92,9 +92,9 @@ async def test_refresh_is_throttled_within_the_interval(
 async def test_refresh_runs_every_time_when_interval_is_zero(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv(branch_overlay.ENV_REFRESH_SECONDS, "0")
+    monkeypatch.setenv(branch_search.ENV_REFRESH_SECONDS, "0")
     calls: list[Path] = []
-    monkeypatch.setattr(branch_overlay, "_refresh_clone_sync", _recording_refresh(calls))
+    monkeypatch.setattr(branch_search, "_refresh_clone_sync", _recording_refresh(calls))
     manager = _manager(tmp_path)
 
     for _ in range(3):
@@ -114,7 +114,7 @@ async def test_refresh_failure_is_swallowed_and_still_throttles(
         calls += 1
         raise RuntimeError("remote is down")
 
-    monkeypatch.setattr(branch_overlay, "_refresh_clone_sync", _boom)
+    monkeypatch.setattr(branch_search, "_refresh_clone_sync", _boom)
     manager = _manager(tmp_path)
 
     await manager._refresh_clone()  # must not raise
@@ -171,7 +171,7 @@ def test_refresh_without_pull_enabled_fetches_only(clone: Path, tmp_path: Path) 
     head_before = _out(clone, "rev-parse", "HEAD")
     index_before = (clone / ".git" / "index").read_bytes()
 
-    assert branch_overlay._refresh_clone_sync(clone) == "fetched"
+    assert branch_search._refresh_clone_sync(clone) == "fetched"
 
     # The branch pushed after the clone is now resolvable...
     assert git_ops.resolve_commit(clone, "late") is not None
@@ -192,7 +192,7 @@ def test_refresh_with_pull_enabled_advances_the_base(
     _push_new_branch(tmp_path)
     _push_to_main(tmp_path)
 
-    assert branch_overlay._refresh_clone_sync(clone).startswith("updated")
+    assert branch_search._refresh_clone_sync(clone).startswith("updated")
 
     assert (clone / "keep.py").read_text() == "v2\n"
     assert _out(clone, "rev-parse", "HEAD") == _out(clone, "rev-parse", "origin/main")
@@ -211,4 +211,4 @@ def test_refresh_reports_failure_instead_of_raising(tmp_path: Path) -> None:
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", "init")
 
-    assert branch_overlay._refresh_clone_sync(repo).startswith("fetch failed:")
+    assert branch_search._refresh_clone_sync(repo).startswith("fetch failed:")

@@ -269,11 +269,12 @@ def create_mcp_server(
             default=None,
             description=(
                 "Git branch (or ref/SHA) to search. Omit to search the checked-out"
-                " base branch (the default). Any other ref searches that branch by"
-                " overlaying its changes on the base index: results for files it"
-                " modified reflect the branch's version. Very divergent branches"
-                " return an extra 'lexical' section (see each result's 'source')."
-                " The branch must already exist in the server's local clone."
+                " base branch (the default). Any other ref searches that branch:"
+                " semantic results over the base index with the files that branch"
+                " changed hidden, plus a text scan of the branch's own version of"
+                " them, returned as a distinct 'lexical' section (see each result's"
+                " 'source'). The branch is fetched on demand if the server's clone"
+                " does not have it."
             ),
         ),
     ) -> SearchResultModel:
