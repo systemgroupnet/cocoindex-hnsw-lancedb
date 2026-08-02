@@ -26,6 +26,7 @@ from cocoindex_code.protocol import (
     IndexRequest,
     IndexResponse,
     IndexWaitingNotice,
+    MemoryStatsRequest,
     ProjectStatusRequest,
     RemoveProjectRequest,
     Response,
@@ -201,6 +202,25 @@ def test_daemon_status(daemon_sock: str) -> None:
     assert resp.version == __version__
     assert resp.uptime_seconds > 0
     conn.close()
+
+
+def test_memory_stats_returns_the_doctor_memory_check(daemon_sock: str) -> None:
+    """`ccc memory-stats` serves the doctor Memory check on its own request.
+
+    No project is loaded and no model or remote is touched, so it stays cheap
+    enough to poll while an index pass or a grep burst is running.
+    """
+    conn, _ = _connect_and_handshake(daemon_sock)
+    conn.send_bytes(encode_request(MemoryStatsRequest()))
+    resp = decode_response(conn.recv_bytes())
+    conn.close()
+
+    assert resp.result.name == "Memory"
+    assert resp.result.ok
+    assert resp.result.errors == []
+    joined = "\n".join(resp.result.details)
+    for expected in ("Memory limit:", "Max in-flight files:", "Text scan queue:"):
+        assert expected in joined, f"missing {expected!r} in:\n{joined}"
 
 
 def test_daemon_project_status_after_index(daemon_sock: str, daemon_project: str) -> None:

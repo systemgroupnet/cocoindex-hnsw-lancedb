@@ -71,6 +71,15 @@ class DoctorRequest(_msgspec.Struct, tag="doctor"):
     project_root: str | None = None
 
 
+class MemoryStatsRequest(_msgspec.Struct, tag="memory_stats"):
+    """Just the memory picture — the `ccc doctor` Memory check on its own.
+
+    Separate from ``DoctorRequest`` because doctor also exercises the embedding
+    model and probes the git remote; this has to stay cheap enough to poll while
+    watching an index pass.
+    """
+
+
 class DaemonEnvRequest(_msgspec.Struct, tag="daemon_env"):
     pass
 
@@ -103,6 +112,7 @@ Request = (
     | RemoveProjectRequest
     | StopRequest
     | DoctorRequest
+    | MemoryStatsRequest
     | DaemonEnvRequest
     | CompactRequest
     | PushMetricsRequest
@@ -243,6 +253,13 @@ class DoctorResponse(_msgspec.Struct, tag="doctor"):
     final: bool = False
 
 
+class MemoryStatsResponse(_msgspec.Struct, tag="memory_stats"):
+    """Carries the same ``DoctorCheckResult`` the doctor Memory check produces,
+    so both surfaces format one payload built in one place."""
+
+    result: DoctorCheckResult
+
+
 class DbPathMappingEntry(_msgspec.Struct):
     source: str
     target: str
@@ -295,6 +312,7 @@ Response = (
     | RemoveProjectResponse
     | StopResponse
     | DoctorResponse
+    | MemoryStatsResponse
     | DaemonEnvResponse
     | CompactResponse
     | PushMetricsResponse

@@ -42,6 +42,8 @@ from .protocol import (
     IndexRequest,
     IndexResponse,
     IndexWaitingNotice,
+    MemoryStatsRequest,
+    MemoryStatsResponse,
     ProjectStatusRequest,
     ProjectStatusResponse,
     PullRequest,
@@ -374,6 +376,11 @@ def stop() -> StopResponse:
 def daemon_env() -> DaemonEnvResponse:
     """Get environment variable names from the daemon."""
     return _send(DaemonEnvRequest())  # type: ignore[return-value]
+
+
+def memory_stats() -> MemoryStatsResponse:
+    """Get the daemon's memory budget, gates and scan queue in one snapshot."""
+    return _send(MemoryStatsRequest())  # type: ignore[return-value]
 
 
 def compact(project_root: str) -> CompactResponse:

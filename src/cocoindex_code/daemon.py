@@ -60,6 +60,8 @@ from .protocol import (
     IndexRequest,
     IndexStreamResponse,
     IndexWaitingNotice,
+    MemoryStatsRequest,
+    MemoryStatsResponse,
     ProjectStatusRequest,
     PullRequest,
     PullResponse,
@@ -785,6 +787,12 @@ async def _dispatch(
         if isinstance(req, StopRequest):
             on_shutdown()
             return StopResponse(ok=True)
+
+        if isinstance(req, MemoryStatsRequest):
+            # Deliberately not routed through the doctor stream: no project is
+            # loaded, no model is exercised, no remote is probed. Just the
+            # governor's own snapshot, so this stays safe to poll.
+            return MemoryStatsResponse(result=_check_memory(registry.governor))
 
         if isinstance(req, DaemonEnvRequest):
             from .protocol import DbPathMappingEntry

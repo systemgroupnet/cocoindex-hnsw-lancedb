@@ -166,6 +166,7 @@ ccc search "authentication logic"       # search!
 | `ccc status` | Show index stats (chunk count, file count, language breakdown) |
 | `ccc mcp` | Run as MCP server in stdio mode |
 | `ccc doctor` | Run diagnostics — checks settings, daemon, model, file matching, and index health |
+| `ccc memory-stats` | Show just the memory budget, concurrency gates and text-scan queue — the `doctor` Memory section, without loading the model or probing git (see [Limiting memory](#limiting-memory)) |
 | `ccc compact` | Reclaim disk — compact index files and prune all superseded versions (see [Disk usage and compaction](#disk-usage-and-compaction)) |
 | `ccc reset` | Delete index databases. `--all` also removes settings. `-f` skips confirmation. |
 | `ccc daemon status` | Show daemon version, uptime, and loaded projects |
@@ -369,7 +370,7 @@ Under hard memory pressure the live monitor halves scan concurrency alongside th
 **Excess requests queue — they are never rejected.** A scan past the pool size waits for a permit and is then served; nothing is dropped, errored, or killed. A waiting request costs almost nothing (it holds no `rg` process, no worker thread, no file handles — the permit is taken *before* any of that is allocated), so the queue is cheap but it does add latency. Watch it with:
 
 ```bash
-docker exec cocoindex-code ccc doctor   # "Memory" check
+docker exec cocoindex-code ccc memory-stats
 ```
 
 ```
@@ -394,7 +395,7 @@ docker run --memory 4g --memory-swap 4g ... cocoindex-code:local
 **Verify** what the daemon detected and how it budgeted:
 
 ```bash
-docker exec cocoindex-code ccc doctor   # see the "Memory" check
+docker exec cocoindex-code ccc memory-stats   # or `ccc doctor` for everything
 ```
 
 **Fine-tuning** (env vars, all optional — the cgroup limit is used by default):

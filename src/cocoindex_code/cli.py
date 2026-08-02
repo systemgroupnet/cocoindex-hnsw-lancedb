@@ -1081,6 +1081,21 @@ def _print_doctor_result(result: DoctorCheckResult, *, verbose: bool = False) ->
             )
 
 
+@app.command("memory-stats")
+@_catch_daemon_start_error
+def memory_stats() -> None:
+    """Show the daemon's memory budget, concurrency gates and text-scan queue.
+
+    The same Memory section `ccc doctor` prints, on its own. Doctor also loads
+    the embedding model and probes the git remote, so this is the one to reach
+    for while an index pass is running or a grep burst is in flight — it only
+    reads the governor's counters.
+    """
+    from . import client as _client
+
+    _print_doctor_result(_client.memory_stats().result)
+
+
 @app.command()
 @_catch_daemon_start_error
 def doctor(
