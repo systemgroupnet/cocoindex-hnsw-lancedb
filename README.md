@@ -165,7 +165,7 @@ ccc search "authentication logic"       # search!
 | `ccc grep <pattern>` | Exact text/regex search via ripgrep — no index needed (see [Grep options](#grep-options)) |
 | `ccc status` | Show index stats (chunk count, file count, language breakdown) |
 | `ccc mcp` | Run as MCP server in stdio mode |
-| `ccc doctor` | Run diagnostics — checks settings, daemon, model, file matching, and index health |
+| `ccc doctor` | Run diagnostics — checks settings, daemon, model, memory, file matching, and index health |
 | `ccc memory-stats` | Show just the memory budget, concurrency gates and text-scan queue — the `doctor` Memory section, without loading the model or probing git (see [Limiting memory](#limiting-memory)) |
 | `ccc compact` | Reclaim disk — compact index files and prune all superseded versions (see [Disk usage and compaction](#disk-usage-and-compaction)) |
 | `ccc reset` | Delete index databases. `--all` also removes settings. `-f` skips confirmation. |
@@ -204,7 +204,7 @@ It reads the working tree directly, so it needs **no index** — it works before
 
 Two bounds apply to every scan, so one query can't blow the daemon's memory budget: files over 16 MB aren't searched, and a line longer than 2000 characters is cut at that point and marked with `…`. See [Limiting memory](#limiting-memory).
 
-Requires the `rg` binary on the machine running the daemon — included in the Docker image; on a source checkout install it yourself (`apt-get install ripgrep`, `brew install ripgrep`, `winget install BurntSushi.ripgrep.MSVC`).
+Requires the `rg` binary on the machine running the daemon — included in the Docker image; on a source checkout install it yourself (`apt-get install ripgrep`, `brew install ripgrep`, `winget install BurntSushi.ripgrep.MSVC`). `ccc grep` and the `ripgrep` tool need it outright. [Branch search](#branch-search) uses it too, for the diff side, but falls back to an equivalent in-process Python scan when it is missing — same results, slower on large diffs.
 
 ## Branch search
 
@@ -359,13 +359,13 @@ Indexing is memory-hungry: the engine keeps many files in flight at once (each h
 
 The daemon **detects the container's memory limit and sizes itself to fit**: it reads the cgroup limit at startup, caps how many files it indexes concurrently so the working set stays within budget, and throttles that concurrency further in real time as usage approaches the limit. So you just set a limit the normal Docker way — no app-specific configuration required.
 
-**Text scans are governed too.** `ccc grep` / the `ripgrep` MCP tool spawn `rg` subprocesses, which are charged to the same cgroup as everything else. Three bounds keep them inside it:
+**Text scans are governed too.** `ccc grep`, the `ripgrep` MCP tool, and the diff side of every [branch search](#branch-search) spawn `rg` subprocesses, which are charged to the same cgroup as everything else. All three go through one gate, with the same three bounds:
 
 - **At most 4 scans run at once** (a worker pool, like any connection pool). Further requests queue rather than forking more processes.
 - **Files over 16 MB aren't searched**, and match lines are cut at 2000 characters. One checked-in dump or minified bundle would otherwise be buffered whole.
-- **A branch scan reads the branch's changed files in batches**, sized from the memory limit, instead of loading all of them at once. Grepping a branch that rewrote 5,000 files costs one batch of resident text, not 5,000 files — it just takes more passes.
+- **A branch scan reads the branch's changed files in batches**, sized from the memory limit, instead of loading all of them at once. Searching or grepping a branch that rewrote 5,000 files costs one batch of resident text, not 5,000 files — it just takes more passes.
 
-Under hard memory pressure the live monitor halves scan concurrency alongside the indexing gate; under soft pressure only indexing eases off, so an interactive grep still gets served.
+Under hard memory pressure the live monitor halves scan concurrency alongside the indexing gate; under soft pressure only indexing eases off, so an interactive search or grep still gets served.
 
 **Excess requests queue — they are never rejected.** A scan past the pool size waits for a permit and is then served; nothing is dropped, errored, or killed. A waiting request costs almost nothing (it holds no `rg` process, no worker thread, no file handles — the permit is taken *before* any of that is allocated), so the queue is cheap but it does add latency. Watch it with:
 
@@ -413,11 +413,11 @@ docker exec cocoindex-code ccc memory-stats   # or `ccc doctor` for everything
 -e COCOINDEX_CODE_MAX_CONCURRENT_SCANS=2
 ```
 
-> **What's sized vs. what's fixed.** The indexing fan-out and the branch-scan batch size are derived from the detected limit. Scan concurrency and the 16 MB file cut are *fixed policy* — deliberately, because no one has measured what one `rg` process costs on your workload, and a made-up per-scan byte estimate would look more precise than it is. Both are overridable, and `ccc doctor` prints what's in effect.
+> **What's sized vs. what's fixed.** The indexing fan-out and the branch-scan batch size are derived from the detected limit. Scan concurrency and the 16 MB file cut are *fixed policy* — deliberately, because no one has measured what one `rg` process costs on your workload, and a made-up per-scan byte estimate would look more precise than it is. Both are overridable, and `ccc memory-stats` prints what's in effect.
 
 The images also set `MALLOC_ARENA_MAX=2` to keep native (torch / Arrow / Lance) allocations from fragmenting resident memory upward over time. If you need to squeeze RSS further, preloading a `jemalloc`/`tcmalloc` allocator via `LD_PRELOAD` is the next lever.
 
-> If no memory limit is detected (e.g. an unconstrained container or a non-Linux host), indexing falls back to the engine default with no runtime throttling, and text scans use fixed defaults rather than a sized budget — they stay bounded, just not fitted to anything. `ccc doctor` flags this so you can set `COCOINDEX_CODE_MEMORY_LIMIT_MB` to re-enable the guard.
+> If no memory limit is detected (e.g. an unconstrained container or a non-Linux host), indexing falls back to the engine default with no runtime throttling, and text scans use fixed defaults rather than a sized budget — they stay bounded, just not fitted to anything. `ccc memory-stats` flags this so you can set `COCOINDEX_CODE_MEMORY_LIMIT_MB` to re-enable the guard.
 
 ### Scheduled maintenance & git sync
 
@@ -425,7 +425,7 @@ The daemon runs one **daily maintenance workflow** that, for each target repo, d
 
 1. **git pull** — fetch and hard-reset the working tree to its upstream (opt-in; skipped for non-git directories),
 2. **index** — an incremental index pass over the refreshed tree,
-3. **push metrics** — write an index-stats snapshot to MySQL (only when the `COCOINDEX_CODE_METRICS_*` target is configured),
+3. **push metrics** — write an index-stats snapshot to MySQL (only when the `COCOINDEX_CODE_METRICS_*` target is configured).
 
 In the Docker image it targets the mounted repo (`/workspace`) at 03:00 local by default. Run steps on demand with `ccc pull` (step 1) and `ccc index` (step 2).
 

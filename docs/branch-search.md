@@ -1,6 +1,6 @@
 # Branch search
 
-Search arbitrary git branches without maintaining a full index per branch.
+Search arbitrary git branches without indexing them.
 
 ## Motivation
 
@@ -13,8 +13,9 @@ searchable. That blocks a common workflow: semantic code search / review of a
 
 Re-indexing the whole tree per branch is the obvious fix and the wrong one: it
 re-embeds the entire codebase for every branch, most of which is identical to
-the base. The branch's *novelty* is exactly the files it changed, which is
-usually small. Branch search exploits that.
+the base. The branch's *novelty* is exactly the files it changed. Branch
+search reads only those, and *scans* them rather than embedding them, so a
+branch costs a text pass over its diff and no model calls at all.
 
 ## Model
 
@@ -68,7 +69,7 @@ the single most important correctness point.
 
 ```
 .cocoindex_code/lancedb/
-  code_chunks.lance/            # the base index - the only table
+  code_chunks.lance/            # the base index — the only table
 ```
 
 Branch search writes nothing. The branch side is read from git and scanned in
@@ -157,10 +158,10 @@ One path, for every branch regardless of divergence.
    sets, filtered by the same include/exclude/gitignore matchers the base
    indexer uses.
 3. Serve **two labeled sections**:
-   - **`source = "semantic"`** - `code_chunks` with
+   - **`source = "semantic"`** — `code_chunks` with
      `WHERE file_path NOT IN (<shadow set>)`: the base, with the branch's
      touched files hidden.
-   - **`source = "lexical"`** - a ripgrep scan (with an in-process Python
+   - **`source = "lexical"`** — a ripgrep scan (with an in-process Python
      fallback when the `rg` binary is absent) of the branch's version of the
      files it added or modified.
 
@@ -181,7 +182,7 @@ That batching is exact, not an approximation: a lexical hit's score is the
 fraction of query terms present in its own snippet, independent of every other
 hit, so merging per-batch winners yields the same ranking as scoring the whole
 diff at once. The whole scan holds one text-scan permit from the governor
-(`scan_slot`), the same gate the `ripgrep` tool uses - a branch search spawns rg
+(`scan_slot`), the same gate the `ripgrep` tool uses — a branch search spawns rg
 exactly like a grep does.
 
 ## MCP surface
