@@ -8,6 +8,8 @@ Built on the [CocoIndex](https://github.com/cocoindex-io/cocoindex) Rust indexin
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-5B5BD6?logoColor=white)](https://opensource.org/licenses/Apache-2.0)
 
+**[Feature overview →](https://systemgroupnet.github.io/cocoindex-hnsw-lancedb/)** — a walkthrough of what this fork adds. Source in [`site/`](./site), published by [`.github/workflows/pages.yml`](./.github/workflows/pages.yml).
+
 ## What this fork focuses on
 
 Everything below is what this fork adds or emphasizes on top of upstream's semantic-search core:

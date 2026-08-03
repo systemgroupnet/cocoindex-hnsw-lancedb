@@ -1,0 +1,1384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SG cocoindex-code — resident code search with LanceDB + HNSW</title>
+<meta name="description" content="A fork of cocoindex-code that turns the one-shot CLI into a long-running daemon: an embedded LanceDB + HNSW vector store, semantic search over any git branch with no per-branch index, branch-aware ripgrep, and a container-aware memory governor.">
+<link rel="canonical" href="https://systemgroupnet.github.io/cocoindex-hnsw-lancedb/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="SG cocoindex-code — resident code search with LanceDB + HNSW">
+<meta property="og:description" content="A warm daemon, an embedded LanceDB + HNSW store, branch search with no per-branch index, and a memory governor that sizes itself to your container.">
+<meta property="og:url" content="https://systemgroupnet.github.io/cocoindex-hnsw-lancedb/">
+<meta name="theme-color" content="#101623" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#eceef2" media="(prefers-color-scheme: light)">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23101623'/%3E%3Cg stroke='%23e0912f' stroke-width='1.6' stroke-linecap='round'%3E%3Cpath d='M7 9h18M7 16h18M7 23h18' opacity='.25'/%3E%3Cpath d='M9 9h7M16 9l6 7M22 16h-9M13 16l-3 7M10 23h12'/%3E%3C/g%3E%3Ccircle cx='22' cy='23' r='3' fill='%236fc5d8'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100..125,500..800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ── tokens ─────────────────────────────────────────────────────────────── */
+:root {
+  color-scheme: light;
+  --ground:      #eceef2;
+  --surface:     #f7f8fa;
+  --surface-sunk:#e3e6ec;
+  --text:        #141a26;
+  --text-dim:    #4d566a;
+  --text-faint:  #6f788c;
+  --rule:        #cfd4de;
+  --rule-soft:   #dde1e8;
+  --accent:      #b4650d;
+  --accent-graph:#d1861f;
+  --accent-wash: #f6ead7;
+  --cool:        #2e7d92;
+  --graph-edge:  #b3bccb;
+  --shadow:      0 1px 2px rgba(20, 26, 38, .05), 0 12px 28px -18px rgba(20, 26, 38, .28);
+
+  --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --body: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+
+  --gutter: clamp(1.25rem, 4vw, 3.5rem);
+  --measure: 66ch;
+  --shell: 1160px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --ground:      #0c111b;
+    --surface:     #141b29;
+    --surface-sunk:#090d15;
+    --text:        #e2e7f0;
+    --text-dim:    #a2adc0;
+    --text-faint:  #7c879b;
+    --rule:        #263043;
+    --rule-soft:   #1c2434;
+    --accent:      #f0a63c;
+    --accent-graph:#f0a63c;
+    --accent-wash: #241a0d;
+    --cool:        #7fcfe2;
+    --graph-edge:  #313d52;
+    --shadow:      0 1px 2px rgba(0, 0, 0, .4), 0 16px 34px -20px rgba(0, 0, 0, .8);
+  }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --ground:      #eceef2;
+  --surface:     #f7f8fa;
+  --surface-sunk:#e3e6ec;
+  --text:        #141a26;
+  --text-dim:    #4d566a;
+  --text-faint:  #6f788c;
+  --rule:        #cfd4de;
+  --rule-soft:   #dde1e8;
+  --accent:      #b4650d;
+  --accent-graph:#d1861f;
+  --accent-wash: #f6ead7;
+  --cool:        #2e7d92;
+  --graph-edge:  #b3bccb;
+  --shadow:      0 1px 2px rgba(20, 26, 38, .05), 0 12px 28px -18px rgba(20, 26, 38, .28);
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ground:      #0c111b;
+  --surface:     #141b29;
+  --surface-sunk:#090d15;
+  --text:        #e2e7f0;
+  --text-dim:    #a2adc0;
+  --text-faint:  #7c879b;
+  --rule:        #263043;
+  --rule-soft:   #1c2434;
+  --accent:      #f0a63c;
+  --accent-graph:#f0a63c;
+  --accent-wash: #241a0d;
+  --cool:        #7fcfe2;
+  --graph-edge:  #313d52;
+  --shadow:      0 1px 2px rgba(0, 0, 0, .4), 0 16px 34px -20px rgba(0, 0, 0, .8);
+}
+
+/* ── base ───────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--text);
+  font-family: var(--body);
+  font-size: 16.5px;
+  line-height: 1.62;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3, h4 {
+  font-family: var(--display);
+  font-variation-settings: "wdth" 116, "wght" 700;
+  line-height: 1.04;
+  letter-spacing: -.022em;
+  text-wrap: balance;
+  margin: 0;
+}
+p { margin: 0; }
+figure, figcaption { margin: 0; }
+a { color: inherit; }
+:where(a):focus-visible, :where(button):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+code, kbd, pre, samp { font-family: var(--mono); }
+hr { border: 0; border-top: 1px solid var(--rule-soft); margin: 0; }
+
+.shell { width: 100%; max-width: var(--shell); margin-inline: auto; padding-inline: var(--gutter); }
+.prose { max-width: var(--measure); }
+
+.eyebrow {
+  font-family: var(--mono);
+  font-size: .705rem;
+  font-weight: 500;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin: 0;
+}
+.lede { color: var(--text-dim); font-size: 1.06rem; }
+.small { font-size: .93rem; color: var(--text-dim); }
+.mono { font-family: var(--mono); font-size: .9em; }
+.nowrap { white-space: nowrap; }
+
+/* inline code */
+:not(pre) > code {
+  font-size: .855em;
+  background: var(--surface-sunk);
+  border: 1px solid var(--rule-soft);
+  border-radius: 3px;
+  padding: .08em .34em;
+  white-space: nowrap;
+}
+
+/* ── header ─────────────────────────────────────────────────────────────── */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--ground);
+  background: color-mix(in srgb, var(--ground) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--rule-soft);
+}
+.topbar-in {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  min-height: 58px;
+}
+.brand {
+  font-family: var(--mono);
+  font-size: .84rem;
+  font-weight: 500;
+  letter-spacing: -.01em;
+  text-decoration: none;
+  display: flex;
+  align-items: baseline;
+  gap: .5ch;
+}
+.brand b { font-weight: 500; }
+.brand span { color: var(--text-faint); }
+.topnav { display: flex; gap: 1.35rem; margin-left: auto; align-items: center; }
+.topnav a {
+  font-size: .875rem;
+  text-decoration: none;
+  color: var(--text-dim);
+  padding-block: .2rem;
+  border-bottom: 1px solid transparent;
+}
+.topnav a:hover { color: var(--text); border-bottom-color: var(--accent); }
+.topnav .repo-link { color: var(--text); font-weight: 500; }
+@media (max-width: 720px) { .topnav .hide-sm { display: none; } }
+@media (max-width: 520px) {
+  .topnav { gap: .9rem; }
+  .topnav .hide-xs, .brand span { display: none; }
+}
+.theme-toggle {
+  font-family: var(--mono);
+  font-size: .72rem;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: .3rem .68rem;
+  cursor: pointer;
+}
+.theme-toggle:hover { color: var(--text); border-color: var(--text-faint); }
+
+/* ── hero ───────────────────────────────────────────────────────────────── */
+.hero { padding-block: clamp(3rem, 7vw, 5.5rem) clamp(2.5rem, 5vw, 4rem); }
+.hero-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.02fr) minmax(0, .98fr);
+  gap: clamp(2rem, 5vw, 4rem);
+  align-items: center;
+}
+@media (max-width: 900px) { .hero-grid { grid-template-columns: minmax(0, 1fr); } }
+.hero-copy { display: flex; flex-direction: column; gap: 1.4rem; align-items: start; }
+.hero h1 {
+  font-size: clamp(2.5rem, 6.2vw, 4.05rem);
+  font-variation-settings: "wdth" 112, "wght" 700;
+  letter-spacing: -.03em;
+}
+.hero h1 em {
+  font-style: normal;
+  color: var(--accent);
+}
+.hero .lede { font-size: clamp(1.02rem, 1.6vw, 1.16rem); max-width: 34rem; }
+.fork-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: .6ch;
+  font-family: var(--mono);
+  font-size: .74rem;
+  letter-spacing: .04em;
+  color: var(--text-dim);
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: .3rem .8rem;
+  text-decoration: none;
+}
+.fork-tag b { color: var(--text); font-weight: 500; }
+.fork-tag:hover { border-color: var(--accent); }
+
+.cta-row { display: flex; flex-wrap: wrap; gap: .7rem; }
+.btn {
+  font-family: var(--body);
+  font-size: .93rem;
+  font-weight: 500;
+  text-decoration: none;
+  padding: .62rem 1.15rem;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: .55ch;
+}
+.btn-primary { background: var(--text); color: var(--ground); }
+.btn-primary:hover { background: var(--accent); color: var(--ground); }
+.btn-ghost { border-color: var(--rule); color: var(--text); }
+.btn-ghost:hover { border-color: var(--text-faint); background: var(--surface); }
+
+.spec-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-top: 1px solid var(--rule);
+  margin-top: clamp(2.5rem, 5vw, 3.75rem);
+}
+@media (max-width: 640px) { .spec-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.spec {
+  padding: 1.1rem 1.1rem 1.1rem 0;
+  border-right: 1px solid var(--rule-soft);
+  display: flex;
+  flex-direction: column;
+  gap: .1rem;
+}
+.spec + .spec { padding-left: 1.15rem; }
+.spec:last-child { border-right: 0; }
+@media (max-width: 640px) {
+  .spec:nth-child(2n) { border-right: 0; }
+  .spec:nth-child(-n+2) { border-bottom: 1px solid var(--rule-soft); }
+  .spec:nth-child(3) { padding-left: 0; }
+}
+.spec dt {
+  font-family: var(--mono);
+  font-size: .68rem;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.spec dd {
+  margin: 0;
+  font-family: var(--display);
+  font-variation-settings: "wdth" 108, "wght" 600;
+  font-size: 1.32rem;
+  letter-spacing: -.015em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── hnsw figure ────────────────────────────────────────────────────────── */
+.figure-hnsw {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.figure-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: .35rem 1rem;
+  padding: .7rem .95rem;
+  border-bottom: 1px solid var(--rule-soft);
+}
+.figure-head .eyebrow { font-size: .67rem; white-space: nowrap; }
+.figure-head .state {
+  font-family: var(--mono);
+  font-size: .7rem;
+  color: var(--accent);
+  white-space: nowrap;
+}
+.canvas-wrap { position: relative; aspect-ratio: 5 / 4; }
+@media (max-width: 900px) { .canvas-wrap { aspect-ratio: 16 / 11; } }
+#hnsw { display: block; width: 100%; height: 100%; }
+.layer-tag {
+  position: absolute;
+  left: .85rem;
+  font-family: var(--mono);
+  font-size: .655rem;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  pointer-events: none;
+}
+.figure-foot {
+  padding: .7rem .95rem .8rem;
+  border-top: 1px solid var(--rule-soft);
+  font-size: .8rem;
+  color: var(--text-dim);
+}
+
+/* ── section frame ──────────────────────────────────────────────────────── */
+.band {
+  border-top: 1px solid var(--rule-soft);
+  padding-block: clamp(3rem, 6vw, 4.75rem);
+  scroll-margin-top: 58px;
+}
+.band-sunk { background: var(--surface-sunk); }
+.band-head { display: flex; flex-direction: column; gap: .85rem; margin-bottom: clamp(1.75rem, 3.5vw, 2.5rem); }
+.band-head h2 { font-size: clamp(1.6rem, 3.1vw, 2.2rem); }
+.band-head p { max-width: var(--measure); color: var(--text-dim); }
+
+/* ── datasheet rows ─────────────────────────────────────────────────────── */
+.sheet { display: grid; gap: 0; }
+.row {
+  display: grid;
+  grid-template-columns: 8.5rem minmax(0, 1fr);
+  gap: clamp(1rem, 3vw, 2.5rem);
+  padding-block: 1.6rem;
+  border-top: 1px solid var(--rule-soft);
+  align-items: start;
+}
+.row:first-child { border-top-color: var(--rule); }
+.row-key { display: flex; flex-direction: column; gap: .35rem; }
+.row-key .tag {
+  font-family: var(--mono);
+  font-size: .755rem;
+  color: var(--accent);
+  letter-spacing: -.01em;
+}
+.row-key .sub { font-family: var(--mono); font-size: .66rem; color: var(--text-faint); letter-spacing: .06em; }
+.row-body { display: flex; flex-direction: column; gap: .55rem; }
+.row-body h3 { font-size: 1.12rem; font-variation-settings: "wdth" 106, "wght" 650; letter-spacing: -.012em; }
+.row-body p { color: var(--text-dim); max-width: var(--measure); font-size: .965rem; }
+@media (max-width: 700px) {
+  .row { grid-template-columns: minmax(0, 1fr); gap: .7rem; }
+  .row-key { flex-direction: row; align-items: baseline; gap: .8ch; }
+}
+
+/* ── code ───────────────────────────────────────────────────────────────── */
+.code {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+}
+.code-bar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: .42rem .7rem;
+  border-bottom: 1px solid var(--rule-soft);
+  font-family: var(--mono);
+  font-size: .68rem;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.copy {
+  margin-left: auto;
+  font: inherit;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  background: none;
+  border: 0;
+  padding: .1rem .2rem;
+  cursor: pointer;
+}
+.copy:hover { color: var(--accent); }
+.code pre {
+  margin: 0;
+  padding: .85rem .9rem;
+  overflow-x: auto;
+  font-size: .845rem;
+  line-height: 1.72;
+  tab-size: 2;
+}
+.code pre code { white-space: pre; }
+.code .c { color: var(--text-faint); }
+.code .p { color: var(--accent); }
+.code .s { color: var(--cool); }
+
+/* ── generic panels & grids ─────────────────────────────────────────────── */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 1.1rem 1.15rem 1.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: .6rem;
+}
+.panel h3 { font-size: 1.02rem; font-variation-settings: "wdth" 106, "wght" 650; }
+.panel p { color: var(--text-dim); font-size: .93rem; }
+.duo { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: clamp(1rem, 2.5vw, 1.75rem); }
+@media (max-width: 820px) { .duo { grid-template-columns: minmax(0, 1fr); } }
+.trio { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: clamp(1rem, 2vw, 1.35rem); }
+@media (max-width: 900px) { .trio { grid-template-columns: minmax(0, 1fr); } }
+.stack { display: flex; flex-direction: column; gap: clamp(1rem, 2vw, 1.4rem); }
+.stack-tight { display: flex; flex-direction: column; gap: .7rem; }
+.stack > *, .stack-tight > * { min-width: 0; }
+
+/* ── tables ─────────────────────────────────────────────────────────────── */
+.table-scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); }
+table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+th, td { text-align: left; padding: .62rem .85rem; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+thead th {
+  font-family: var(--mono);
+  font-size: .68rem;
+  font-weight: 500;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  border-bottom-color: var(--rule);
+  white-space: nowrap;
+}
+tbody tr:last-child td { border-bottom: 0; }
+td.k { font-family: var(--mono); font-size: .82rem; white-space: nowrap; color: var(--text); }
+td.dim { color: var(--text-dim); }
+td.num { font-variant-numeric: tabular-nums; }
+.t-fork { color: var(--text); }
+.t-fork b { color: var(--accent); font-weight: 500; }
+
+/* ── branch diagram ─────────────────────────────────────────────────────── */
+.bd {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 2.5rem minmax(0, 1fr);
+  align-items: center;
+  gap: .9rem;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: clamp(1rem, 2.5vw, 1.6rem);
+}
+@media (max-width: 780px) { .bd { grid-template-columns: minmax(0, 1fr); } }
+.bd-col { display: flex; flex-direction: column; gap: .55rem; }
+.bd-box {
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: .6rem .7rem;
+  background: var(--ground);
+  display: flex;
+  flex-direction: column;
+  gap: .2rem;
+}
+.bd-box .t { font-family: var(--mono); font-size: .74rem; color: var(--text); }
+.bd-box .d { font-size: .8rem; color: var(--text-faint); }
+.bd-hidden { border-style: dashed; opacity: .72; }
+.bd-hidden .t { text-decoration: line-through; text-decoration-color: var(--accent); }
+.bd-join {
+  font-family: var(--mono);
+  font-size: 1.25rem;
+  color: var(--accent);
+  text-align: center;
+  line-height: 1;
+}
+@media (max-width: 780px) { .bd-join { text-align: left; } }
+.bd-out {
+  grid-column: 1 / -1;
+  border-top: 1px solid var(--rule-soft);
+  margin-top: .5rem;
+  padding-top: .85rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem .9rem;
+  align-items: baseline;
+  font-size: .875rem;
+  color: var(--text-dim);
+}
+.pill {
+  font-family: var(--mono);
+  font-size: .72rem;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: .12rem .6rem;
+  color: var(--text);
+  background: var(--ground);
+}
+.pill-accent { border-color: var(--accent); color: var(--accent); background: var(--accent-wash); }
+.pill-cool { border-color: var(--cool); color: var(--cool); }
+
+/* ── note ───────────────────────────────────────────────────────────────── */
+.note {
+  border-left: 2px solid var(--accent);
+  padding: .15rem 0 .15rem .9rem;
+  font-size: .92rem;
+  color: var(--text-dim);
+  max-width: var(--measure);
+}
+.note b { color: var(--text); font-weight: 600; }
+
+/* ── language grid ──────────────────────────────────────────────────────── */
+.langs { display: flex; flex-wrap: wrap; gap: .45rem; }
+.lang {
+  display: inline-flex;
+  align-items: baseline;
+  gap: .6ch;
+  border: 1px solid var(--rule-soft);
+  border-radius: 3px;
+  background: var(--surface);
+  padding: .28rem .55rem;
+  font-family: var(--mono);
+  font-size: .775rem;
+}
+.lang i { font-style: normal; color: var(--text-faint); font-size: .92em; }
+
+/* ── footer ─────────────────────────────────────────────────────────────── */
+.foot { border-top: 1px solid var(--rule); padding-block: 2.5rem 3rem; }
+.foot-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) repeat(2, minmax(0, 1fr)); gap: 2rem; }
+@media (max-width: 760px) { .foot-grid { grid-template-columns: minmax(0, 1fr); } }
+.foot h4 {
+  font-family: var(--mono);
+  font-size: .68rem;
+  font-weight: 500;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  font-variation-settings: normal;
+  margin-bottom: .55rem;
+}
+.foot ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .3rem; }
+.foot a { color: var(--text-dim); text-decoration: none; font-size: .9rem; }
+.foot a:hover { color: var(--accent); }
+.foot .disclaim { font-size: .85rem; color: var(--text-faint); max-width: 42ch; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="shell topbar-in">
+    <a class="brand" href="#top"><b>sg&#8202;/&#8202;cocoindex-code</b> <span>lance&#183;hnsw</span></a>
+    <nav class="topnav">
+      <a class="hide-sm" href="#fork">What it adds</a>
+      <a class="hide-sm" href="#branch">Branch search</a>
+      <a class="hide-xs" href="#start">Quickstart</a>
+      <a class="repo-link" href="https://github.com/systemgroupnet/cocoindex-hnsw-lancedb">GitHub &#8599;</a>
+      <button class="theme-toggle" type="button" id="theme" aria-label="Switch color theme">Theme</button>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- ── hero ──────────────────────────────────────────────────────────── -->
+  <section class="hero">
+    <div class="shell hero-grid">
+      <div class="hero-copy">
+        <a class="fork-tag" href="https://github.com/cocoindex-io/cocoindex-code">fork of <b>cocoindex-io/cocoindex-code</b> &#8599;</a>
+        <h1>Code search that <em>stays resident</em>.</h1>
+        <p class="lede">This fork turns the one-shot CLI into a long-running service. A background daemon keeps the embedding model loaded and the index open, serving AST-aware semantic search to your coding agents over MCP &mdash; backed by an embedded LanceDB&#8202;+&#8202;HNSW store, searchable on <em>any</em> git branch, and sized to fit the memory limit of the container it runs in.</p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="https://github.com/systemgroupnet/cocoindex-hnsw-lancedb">View the repository</a>
+          <a class="btn btn-ghost" href="#start">Quickstart</a>
+        </div>
+      </div>
+
+      <figure class="figure-hnsw" aria-labelledby="fig-cap">
+        <div class="figure-head">
+          <p class="eyebrow">hnsw &#183; greedy descent</p>
+          <span class="state" id="fig-state">searching</span>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="hnsw" role="img" aria-label="Diagram of a hierarchical navigable small world graph: a query enters the sparse top layer, hops greedily toward its nearest neighbour, then descends into denser layers until it reaches the matching chunk in the base layer."></canvas>
+          <span class="layer-tag" style="top:.7rem">layer 2 &#183; sparse, long hops</span>
+          <span class="layer-tag" style="top:50%; transform:translateY(-50%)">layer 1</span>
+          <span class="layer-tag" style="bottom:.7rem">layer 0 &#183; every chunk</span>
+        </div>
+        <figcaption class="figure-foot" id="fig-cap">Query latency stays <em>sublinear</em> in codebase size: the search descends a layered graph instead of scanning every vector. Below 256 chunks the ANN index is skipped and LanceDB&rsquo;s exact flat scan is used instead.</figcaption>
+      </figure>
+    </div>
+
+    <div class="shell">
+      <dl class="spec-strip">
+        <div class="spec"><dt>Model loads</dt><dd>1 &#183; per daemon</dd></div>
+        <div class="spec"><dt>Per-branch indexes</dt><dd>0</dd></div>
+        <div class="spec"><dt>Vector tables</dt><dd>1</dd></div>
+        <div class="spec"><dt>Languages</dt><dd>31</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <!-- ── what the fork adds ────────────────────────────────────────────── -->
+  <section class="band" id="fork">
+    <div class="shell">
+      <div class="band-head">
+        <p class="eyebrow">the delta</p>
+        <h2>Everything this fork adds on top of the semantic-search core</h2>
+        <p>Upstream gives you AST-based chunking, embeddings and semantic search over a checked-out tree. This fork keeps all of that and rebuilds the parts around it that a shared, always-on deployment needs.</p>
+      </div>
+
+      <div class="sheet">
+        <article class="row">
+          <div class="row-key"><span class="tag">daemon</span><span class="sub">process model</span></div>
+          <div class="row-body">
+            <h3>A warm, concurrent service &mdash; not a cold command</h3>
+            <p>The background daemon keeps the embedding model resident and the index open, so the model loads once instead of once per invocation. Every connection is handled as its own task, so searches from several agents run in parallel rather than queueing behind one another.</p>
+          </div>
+        </article>
+
+        <article class="row">
+          <div class="row-key"><span class="tag">mcp</span><span class="sub">stdio + http</span></div>
+          <div class="row-body">
+            <h3>MCP over stdio, or one HTTP endpoint shared by every client</h3>
+            <p><code>ccc mcp</code> serves a stdio MCP server for a single agent. Set <code>COCOINDEX_CODE_MCP_PORT</code> and the daemon also exposes a streamable-HTTP MCP endpoint against the same in-process registry &mdash; so many clients share one warm process and one copy of the model.</p>
+          </div>
+        </article>
+
+        <article class="row">
+          <div class="row-key"><span class="tag">branch</span><span class="sub">git refs</span></div>
+          <div class="row-body">
+            <h3>Search any branch, index none of them</h3>
+            <p>Query an arbitrary ref &mdash; not just the checked-out one &mdash; by searching the base index with the branch&rsquo;s changed files hidden, then scanning the branch&rsquo;s own version of those files with ripgrep. Nothing per-branch is embedded, stored, or checked out. <a href="#branch">How it works &#8595;</a></p>
+          </div>
+        </article>
+
+        <article class="row">
+          <div class="row-key"><span class="tag">ripgrep</span><span class="sub">exact search</span></div>
+          <div class="row-body">
+            <h3>Exact text and regex, alongside search by meaning</h3>
+            <p>A <code>ripgrep</code> MCP tool and <code>ccc grep</code> for when you know the literal string &mdash; a symbol, an error message, a config key. It reads the working tree directly, so it needs no index, never triggers one, and finds matches in files the index skips. Branch-aware through the same resolution path as <code>search</code>.</p>
+          </div>
+        </article>
+
+        <article class="row">
+          <div class="row-key"><span class="tag">lancedb</span><span class="sub">vector store</span></div>
+          <div class="row-body">
+            <h3>Embedded LanceDB with an HNSW index</h3>
+            <p>Chunk vectors live in an in-process LanceDB table indexed with an HNSW graph over cosine distance &mdash; no server to run, sublinear query latency, and multi-version reads that never block on a writer. Rows are queryable <em>while</em> the first index pass is still running. <a href="#lance">Details &#8595;</a></p>
+          </div>
+        </article>
+
+        <article class="row">
+          <div class="row-key"><span class="tag">memory</span><span class="sub">cgroup aware</span></div>
+          <div class="row-body">
+            <h3>Sizes itself to the container&rsquo;s memory limit</h3>
+            <p>Indexing is memory-hungry enough to trip the OOM killer in a capped container. The daemon reads the cgroup limit at startup, caps how many files it indexes concurrently, and throttles further in real time as usage climbs. You just set <code>--memory</code> the normal Docker way. <a href="#memory">Details &#8595;</a></p>
+          </div>
+        </article>
+
+        <article class="row">
+          <div class="row-key"><span class="tag">schedule</span><span class="sub">daily upkeep</span></div>
+          <div class="row-body">
+            <h3>A daily <span class="nowrap">pull &#8594; index &#8594; push</span> workflow</h3>
+            <p>One maintenance run per day, each step best-effort so a failure in one doesn&rsquo;t stop the next: fetch and hard-reset the mirror (opt-in), incrementally re-index the refreshed tree, then write an index-stats snapshot to MySQL for DevLake. HTTPS credentials are injected through an inline git credential helper &mdash; never written to disk, never in the remote URL, never in argv.</p>
+          </div>
+        </article>
+
+        <article class="row">
+          <div class="row-key"><span class="tag">doctor</span><span class="sub">diagnostics</span></div>
+          <div class="row-body">
+            <h3>Operational visibility for the parts that can go wrong</h3>
+            <p><code>ccc doctor</code> checks settings, daemon health, the model, the memory budget, file matching, index health, and &mdash; when git pull is enabled &mdash; runs a read-only <code>git ls-remote</code> probe so a bad remote or expired token surfaces before the next scheduled pull. <code>ccc memory-stats</code> prints just the memory and scan-queue section without loading the model.</p>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── before / after ───────────────────────────────────────────────── -->
+  <section class="band band-sunk">
+    <div class="shell stack">
+      <div class="band-head" style="margin-bottom:0">
+        <p class="eyebrow">side by side</p>
+        <h2>What changed</h2>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th scope="col">Concern</th><th scope="col">Before this fork</th><th scope="col">In this fork</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="k">Process model</td><td class="dim">One-shot CLI; a stdio MCP server per client</td><td class="t-fork">A <b>warm daemon</b> serving CLI, stdio MCP and HTTP MCP concurrently</td></tr>
+            <tr><td class="k">Vector store</td><td class="dim">sqlite-vec, exact brute-force scan</td><td class="t-fork"><b>LanceDB + HNSW</b> ANN, cosine distance, multi-version reads</td></tr>
+            <tr><td class="k">Search scope</td><td class="dim">The checked-out working tree</td><td class="t-fork"><b>Any git ref</b>, with no per-branch index or embedding</td></tr>
+            <tr><td class="k">Exact search</td><td class="dim">&mdash;</td><td class="t-fork"><b><code>ccc grep</code></b> and a <code>ripgrep</code> MCP tool, index-free and branch-aware</td></tr>
+            <tr><td class="k">Memory under a cap</td><td class="dim">Engine defaults, no runtime throttling</td><td class="t-fork">Concurrency <b>sized from the cgroup limit</b> and throttled live</td></tr>
+            <tr><td class="k">Disk growth</td><td class="dim">&mdash;</td><td class="t-fork">Automatic compaction and pruning, plus <b><code>ccc compact</code></b> and recovery scripts</td></tr>
+            <tr><td class="k">Upkeep</td><td class="dim">Run <code>index</code> yourself</td><td class="t-fork">A <b>daily scheduled</b> pull &#8594; index &#8594; metrics-push workflow</td></tr>
+            <tr><td class="k">Distribution</td><td class="dim">Published package</td><td class="t-fork">Source checkout or a <b>locally built</b> Docker image &mdash; nothing published</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small">This is an independent fork maintained for internal use. It is not on PyPI, is not the upstream package, and is not affiliated with or endorsed by the upstream maintainers.</p>
+    </div>
+  </section>
+
+  <!-- ── branch search ────────────────────────────────────────────────── -->
+  <section class="band" id="branch">
+    <div class="shell stack">
+      <div class="band-head" style="margin-bottom:0">
+        <p class="eyebrow">branch search</p>
+        <h2>One index, every branch</h2>
+        <p>The index is built from the checked-out tree &mdash; normally the branch a deployment keeps reset to, the <em>base</em>. A branch query decomposes into two halves that can&rsquo;t disagree about what the branch contains, and reassembles them into a single ranked result set.</p>
+      </div>
+
+      <div class="bd">
+        <div class="bd-col">
+          <p class="eyebrow">base side</p>
+          <div class="bd-box"><span class="t">base index &#183; all chunks</span><span class="d">vector search over the warm HNSW table</span></div>
+          <div class="bd-box bd-hidden"><span class="t">files the branch touched</span><span class="d">excluded, so a stale base version never surfaces</span></div>
+        </div>
+        <div class="bd-join" aria-hidden="true">&#8853;</div>
+        <div class="bd-col">
+          <p class="eyebrow">branch side</p>
+          <div class="bd-box"><span class="t">added &#43; modified files, branch version</span><span class="d">read from the git object database with <code>git show</code></span></div>
+          <div class="bd-box"><span class="t">ripgrep scan, term-count ranked</span><span class="d">memory-budgeted batches &mdash; a 5,000-file diff costs more passes, not more RAM</span></div>
+        </div>
+        <div class="bd-out">
+          <span>One result set, each hit labelled by where it came from:</span>
+          <span class="pill pill-accent">source: semantic</span>
+          <span class="pill pill-cool">source: lexical</span>
+        </div>
+      </div>
+
+      <div class="duo">
+        <div class="code">
+          <div class="code-bar"><span>search a ref</span><button class="copy" type="button">copy</button></div>
+<pre><code><span class="c"># semantic + lexical, one result set</span>
+ccc search <span class="p">--branch</span> feature/login <span class="s">"session handling"</span>
+
+<span class="c"># exact text on the same ref view</span>
+ccc grep <span class="p">--branch</span> feature/login <span class="s">'session_token'</span></code></pre>
+        </div>
+        <div class="stack-tight">
+          <p class="note"><b>Nothing is ever checked out.</b> No code path runs <code>checkout</code>, <code>switch</code> or <code>reset</code> for a search. HEAD, the git index, the working tree and the local branch list come out byte-identical &mdash; verified in the test suite for both tools. Parallel searches of different branches can&rsquo;t conflict with each other or with an in-flight index pass.</p>
+          <p class="note"><b>A branch pushed minutes ago is searchable.</b> A ref is resolved as given, then through each remote&rsquo;s <code>refs/remotes/</code>, then by an on-demand fetch of that one branch &mdash; reusing the scheduled pull&rsquo;s credentials. Every branch search refreshes the clone first, throttled to one round-trip per minute.</p>
+        </div>
+      </div>
+
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th scope="col">Environment variable</th><th scope="col">Default</th><th scope="col">Effect</th></tr></thead>
+          <tbody>
+            <tr><td class="k">COCOINDEX_CODE_BASE_REF</td><td class="k dim">auto (HEAD)</td><td class="dim">The ref the base index represents, and the diff base. Auto-detected; override when it differs.</td></tr>
+            <tr><td class="k">COCOINDEX_CODE_BRANCH_FETCH_ENABLED</td><td class="k dim">on</td><td class="dim">Set falsy to forbid the on-demand fetch, restricting search to refs already in the clone.</td></tr>
+            <tr><td class="k">COCOINDEX_CODE_BRANCH_REFRESH_SECONDS</td><td class="k dim num">60</td><td class="dim">Minimum seconds between pre-search clone refreshes; <code>0</code> refreshes on every search.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small">The full design, including deferred work on a hardened read-only git guarantee layer, is documented in <a href="https://github.com/systemgroupnet/cocoindex-hnsw-lancedb/blob/main/docs/branch-search.md"><code>docs/branch-search.md</code></a>.</p>
+    </div>
+  </section>
+
+  <!-- ── lancedb ──────────────────────────────────────────────────────── -->
+  <section class="band band-sunk" id="lance">
+    <div class="shell stack">
+      <div class="band-head" style="margin-bottom:0">
+        <p class="eyebrow">vector backend</p>
+        <h2>LanceDB&#8202;+&#8202;HNSW, in process</h2>
+        <p>Chunk embeddings live in one embedded LanceDB table under your index directory. It runs in-process, so the tool stays zero-config while still serving concurrent readers &mdash; and branch search adds no second table.</p>
+      </div>
+
+      <div class="trio">
+        <div class="panel">
+          <h3>Reads never block on writes</h3>
+          <p>LanceDB is multi-version: a search opens a consistent snapshot and reads it independently of any writer. Rows become queryable as they commit, so the index is searchable <em>during</em> the very first pass &mdash; a query only waits when the table is genuinely empty.</p>
+        </div>
+        <div class="panel">
+          <h3>Tuned for recall at top-k</h3>
+          <p>The graph is built with <code>m=20</code> and <code>ef_construction=300</code>, queried at <code>ef=256</code> &mdash; defaults that favour recall for typical top-k code search. HNSW is approximate; raise <code>ef</code> for more recall, lower it for less latency.</p>
+        </div>
+        <div class="panel">
+          <h3>Disk stays bounded</h3>
+          <p>Append-only storage would balloon to tens of GB unmanaged. Each pass compacts fragments and prunes versions older than a 10-minute window &mdash; the margin that lets in-flight readers finish. <code>ccc compact</code> does a one-time aggressive reclaim and reports what it freed.</p>
+        </div>
+      </div>
+
+      <div class="duo">
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th scope="col">Property</th><th scope="col">Value</th></tr></thead>
+            <tbody>
+              <tr><td class="dim">Table</td><td class="k">lancedb/code_chunks.lance</td></tr>
+              <tr><td class="dim">Index</td><td class="k">HNSW, cosine distance</td></tr>
+              <tr><td class="dim">ANN threshold</td><td class="k num">256 chunks</td></tr>
+              <tr><td class="dim">Score</td><td class="k">1 &#8722; cosine_distance &#183; 0..1, higher is better</td></tr>
+              <tr><td class="dim">Language filter</td><td class="k">exact match</td></tr>
+              <tr><td class="dim">Path filter</td><td class="k">GLOB <code>*</code> / <code>?</code> &#8594; SQL LIKE</td></tr>
+              <tr><td class="dim">Auto upkeep</td><td class="k">compact &#43; prune &gt; 10 min</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="stack-tight">
+          <p class="note"><b>One behavioural delta from the old backend.</b> GLOB character classes such as <code>[abc]</code> are not supported by the LanceDB path filter and are treated as literal text. Everything else about <code>--lang</code> and <code>--path</code> filtering is unchanged.</p>
+          <p class="note"><b>Recovery, if a write is killed partway.</b> An OOM or a <code>docker stop</code> mid-merge can leave the latest table version referencing a truncated file. <code>scripts/lance_recover.py</code> rolls back to the newest version that reads cleanly and prunes the corrupt files; re-run <code>ccc index</code> to re-apply anything dropped.</p>
+          <p class="note"><b>Switching embedding models needs a rebuild.</b> Different vector dimensions mean <code>ccc reset &amp;&amp; ccc index</code> &mdash; vectors are re-exported from source rather than migrated in place.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── memory ───────────────────────────────────────────────────────── -->
+  <section class="band" id="memory">
+    <div class="shell stack">
+      <div class="band-head" style="margin-bottom:0">
+        <p class="eyebrow">memory governor</p>
+        <h2>Fits the box it&rsquo;s given</h2>
+        <p>Set a memory limit the normal Docker way and the daemon does the rest: it reads the cgroup limit at startup, sizes its indexing fan-out and branch-scan batches to fit, and eases off in real time as usage approaches the cap. There is no app-specific configuration to get right.</p>
+      </div>
+
+      <div class="duo">
+        <div class="stack-tight">
+          <div class="panel">
+            <h3>Text scans are governed too</h3>
+            <p><code>ccc grep</code>, the <code>ripgrep</code> tool and the diff side of every branch search spawn <code>rg</code> subprocesses charged to the same cgroup. All three pass through one gate: at most 4 scans at once, files over 16&#8239;MB skipped, match lines cut at 2,000 characters.</p>
+          </div>
+          <div class="panel">
+            <h3>Excess requests queue &mdash; never rejected</h3>
+            <p>A scan past the pool size waits for a permit, then gets served; nothing is dropped or killed. Waiting is cheap &mdash; the permit is taken before any <code>rg</code> process, worker thread or file handle is allocated &mdash; but it does add latency, and any wait over 2&#8239;s is logged with the queue state.</p>
+          </div>
+          <p class="note"><b>Under pressure, interactive work is protected.</b> Hard pressure halves scan concurrency alongside the indexing gate; soft pressure eases off indexing only, so a search or grep still gets served.</p>
+        </div>
+
+        <div class="stack-tight">
+          <div class="code">
+            <div class="code-bar"><span>ccc memory-stats</span><button class="copy" type="button">copy</button></div>
+<pre><code>Text scan queue: 4 running, 7 queued (peak queued: 12)
+Scans delayed over 2s: 9 (longest wait: 6.4s).
+Raise COCOINDEX_CODE_MAX_CONCURRENT_SCANS if
+there's memory headroom.</code></pre>
+          </div>
+          <div class="code">
+            <div class="code-bar"><span>optional fine-tuning</span><button class="copy" type="button">copy</button></div>
+<pre><code><span class="c"># plan for less than the hard cap, or set a limit</span>
+<span class="c"># explicitly when no cgroup limit is present</span>
+<span class="p">-e</span> COCOINDEX_CODE_MEMORY_LIMIT_MB=1500
+
+<span class="c"># pin the in-flight file count, bypassing the heuristic</span>
+<span class="p">-e</span> COCOINDEX_CODE_MAX_INFLIGHT_FILES=32
+
+<span class="c"># pin concurrent rg scans (default 4)</span>
+<span class="p">-e</span> COCOINDEX_CODE_MAX_CONCURRENT_SCANS=2</code></pre>
+          </div>
+          <p class="small">Sized from the detected limit: indexing fan-out and branch-scan batch size. Fixed policy, deliberately: scan concurrency and the 16&#8239;MB cut &mdash; a made-up per-scan byte estimate would look more precise than it is. Both are overridable, and <code>ccc memory-stats</code> prints what&rsquo;s in effect.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── quickstart ───────────────────────────────────────────────────── -->
+  <section class="band band-sunk" id="start">
+    <div class="shell stack">
+      <div class="band-head" style="margin-bottom:0">
+        <p class="eyebrow">quickstart</p>
+        <h2>Two ways to run it</h2>
+        <p>Nothing is published to PyPI and no images are pushed &mdash; install from a source checkout for development, or build the Docker image yourself for the deployment path.</p>
+      </div>
+
+      <div class="stack">
+        <div class="code">
+          <div class="code-bar"><span>from source &#183; uv</span><button class="copy" type="button">copy</button></div>
+<pre><code>git clone https://github.com/systemgroupnet/cocoindex-hnsw-lancedb.git
+cd cocoindex-hnsw-lancedb
+uv sync
+
+uv run ccc init      <span class="c"># create settings</span>
+uv run ccc index     <span class="c"># build the index</span>
+uv run ccc search <span class="s">"authentication logic"</span>
+
+<span class="c"># put `ccc` on PATH from this checkout</span>
+uv tool install <span class="s">'.[full]'</span>   <span class="c"># [full] = local embeddings</span></code></pre>
+        </div>
+        <div class="code">
+          <div class="code-bar"><span>docker &#183; build locally</span><button class="copy" type="button">copy</button></div>
+<pre><code><span class="c"># slim (~450 MB) — LiteLLM cloud embeddings</span>
+docker build <span class="p">-t</span> cocoindex-code:local <span class="p">-f</span> docker/Dockerfile .
+
+<span class="c"># full — adds sentence-transformers, no API key needed</span>
+docker build <span class="p">-t</span> cocoindex-code:full \
+  <span class="p">--build-arg</span> CCC_VARIANT=full <span class="p">-f</span> docker/Dockerfile .
+
+<span class="c"># run it persistent, with a memory cap</span>
+COCOINDEX_MEM_LIMIT=4g \
+COCOINDEX_CODE_IMAGE=cocoindex-code:local docker compose up <span class="p">-d</span></code></pre>
+        </div>
+        <div class="code">
+          <div class="code-bar"><span>connect a coding agent</span><button class="copy" type="button">copy</button></div>
+<pre><code><span class="c"># native install</span>
+claude mcp add cocoindex-code <span class="p">--</span> ccc mcp
+codex mcp add cocoindex-code <span class="p">--</span> ccc mcp
+
+<span class="c"># against a persistent container (-i, never -it)</span>
+claude mcp add cocoindex-code <span class="p">--</span> docker exec <span class="p">-i</span> \
+  <span class="p">-e</span> COCOINDEX_CODE_HOST_CWD=<span class="s">"$PWD"</span> cocoindex-code ccc mcp</code></pre>
+        </div>
+        <div class="stack-tight">
+          <p class="note"><b>The daemon starts itself.</b> It comes up on first use and stays warm across sessions, so the embedding model loads once. <code>ccc index</code> auto-initializes too &mdash; you can skip straight to indexing.</p>
+          <p class="note"><b><code>refresh_index</code> defaults to off.</b> Searches read the current table directly, on the assumption the index is refreshed out of band by the scheduled pass. Pass it explicitly to force an incremental update first &mdash; and even then, a refresh that finds a pass already in flight reads concurrently instead of blocking.</p>
+          <p class="small">Embeddings: local SentenceTransformers via the <code>[full]</code> extra (free, no API key, defaulting to <code>snowflake-arctic-embed-xs</code>), or 100+ cloud providers through LiteLLM. See <a href="https://github.com/systemgroupnet/cocoindex-hnsw-lancedb/blob/main/EMBEDDINGS.md">EMBEDDINGS.md</a>.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── cli + tools ──────────────────────────────────────────────────── -->
+  <section class="band" id="cli">
+    <div class="shell stack">
+      <div class="band-head" style="margin-bottom:0">
+        <p class="eyebrow">surface area</p>
+        <h2>The CLI, and the two MCP tools</h2>
+      </div>
+
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead>
+          <tbody>
+            <tr><td class="k">ccc init</td><td class="dim">Initialize a project &mdash; writes settings, adds <code>.cocoindex_code/</code> to <code>.gitignore</code></td></tr>
+            <tr><td class="k">ccc index</td><td class="dim">Build or update the index, with streaming progress. Auto-inits if needed.</td></tr>
+            <tr><td class="k">ccc search &lt;query&gt;</td><td class="dim">Semantic search. Filter by <code>--lang</code> / <code>--path</code>, paginate, or target a <code>--branch</code>.</td></tr>
+            <tr><td class="k">ccc grep &lt;pattern&gt;</td><td class="dim">Exact text or regex via ripgrep &mdash; no index needed. Globs, context lines, <code>--branch</code>.</td></tr>
+            <tr><td class="k">ccc pull</td><td class="dim">Fetch and hard-reset to the git upstream. Discards local changes to tracked files.</td></tr>
+            <tr><td class="k">ccc status</td><td class="dim">Index stats &mdash; chunk count, file count, language breakdown</td></tr>
+            <tr><td class="k">ccc doctor</td><td class="dim">Diagnostics across settings, daemon, model, memory, file matching and index health</td></tr>
+            <tr><td class="k">ccc memory-stats</td><td class="dim">Just the memory budget, concurrency gates and scan queue &mdash; no model load</td></tr>
+            <tr><td class="k">ccc compact</td><td class="dim">Reclaim disk: compact fragments and prune every superseded version</td></tr>
+            <tr><td class="k">ccc reset</td><td class="dim">Delete the index databases. <code>--all</code> also removes settings.</td></tr>
+            <tr><td class="k">ccc mcp</td><td class="dim">Run as an MCP server on stdio</td></tr>
+            <tr><td class="k">ccc daemon status&#8239;|&#8239;restart&#8239;|&#8239;stop</td><td class="dim">Inspect or control the background daemon</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="duo">
+        <div class="panel">
+          <h3><code>search</code> &mdash; find code by meaning</h3>
+          <p>Returns chunks with path, language, code, line numbers, a cosine <code>score</code> and a <code>source</code> field. Takes <code>limit</code>, <code>offset</code>, <code>refresh_index</code>, <code>languages</code>, <code>paths</code> and <code>branch</code>.</p>
+          <p class="small">Use it when you can describe what the code does but not what it&rsquo;s called.</p>
+        </div>
+        <div class="panel">
+          <h3><code>ripgrep</code> &mdash; find code by text</h3>
+          <p>Returns matches with <code>file_path</code>, <code>line_number</code>, <code>content</code>, span, and a <code>truncated</code> flag. Takes <code>pattern</code>, <code>limit</code>, <code>globs</code>, <code>case_sensitive</code>, <code>fixed_strings</code>, <code>context_lines</code> and <code>branch</code>.</p>
+          <p class="small">Honours <code>.gitignore</code>, skips <code>.git</code> and <code>.cocoindex_code</code>. Needs the <code>rg</code> binary &mdash; bundled in the Docker image.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── languages ────────────────────────────────────────────────────── -->
+  <section class="band band-sunk" id="languages">
+    <div class="shell stack">
+      <div class="band-head" style="margin-bottom:0">
+        <p class="eyebrow">31 languages</p>
+        <h2>AST-aware chunking, per language</h2>
+        <p>Chunks follow syntax rather than line windows, so a result is a function or a class instead of an arbitrary slice. Extensions can be extended or overridden in project settings.</p>
+      </div>
+      <div class="langs">
+        <span class="lang">c <i>.c</i></span>
+        <span class="lang">cpp <i>.cpp .cc .cxx .h .hpp</i></span>
+        <span class="lang">csharp <i>.cs</i></span>
+        <span class="lang">css <i>.css .scss</i></span>
+        <span class="lang">dtd <i>.dtd</i></span>
+        <span class="lang">fortran <i>.f .f90 .f95 .f03</i></span>
+        <span class="lang">go <i>.go</i></span>
+        <span class="lang">html <i>.html .htm</i></span>
+        <span class="lang">java <i>.java</i></span>
+        <span class="lang">javascript <i>.js</i></span>
+        <span class="lang">json <i>.json</i></span>
+        <span class="lang">kotlin <i>.kt .kts</i></span>
+        <span class="lang">lua <i>.lua</i></span>
+        <span class="lang">markdown <i>.md .mdx</i></span>
+        <span class="lang">pascal <i>.pas .dpr</i></span>
+        <span class="lang">php <i>.php</i></span>
+        <span class="lang">python <i>.py</i></span>
+        <span class="lang">r <i>.r</i></span>
+        <span class="lang">ruby <i>.rb</i></span>
+        <span class="lang">rust <i>.rs</i></span>
+        <span class="lang">scala <i>.scala</i></span>
+        <span class="lang">solidity <i>.sol</i></span>
+        <span class="lang">sql <i>.sql</i></span>
+        <span class="lang">svelte <i>.svelte</i></span>
+        <span class="lang">swift <i>.swift</i></span>
+        <span class="lang">toml <i>.toml</i></span>
+        <span class="lang">tsx <i>.tsx</i></span>
+        <span class="lang">typescript <i>.ts</i></span>
+        <span class="lang">vue <i>.vue</i></span>
+        <span class="lang">xml <i>.xml</i></span>
+        <span class="lang">yaml <i>.yaml .yml</i></span>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <div class="shell foot-grid">
+    <div>
+      <h4>SG cocoindex-code</h4>
+      <p class="disclaim">A fork of <a href="https://github.com/cocoindex-io/cocoindex-code">cocoindex-io/cocoindex-code</a>, built on the <a href="https://github.com/cocoindex-io/cocoindex">CocoIndex</a> Rust indexing engine. Apache-2.0; upstream copyright and license are retained. Not affiliated with or endorsed by the upstream maintainers.</p>
+    </div>
+    <div>
+      <h4>Documentation</h4>
+      <ul>
+        <li><a href="https://github.com/systemgroupnet/cocoindex-hnsw-lancedb#readme">README</a></li>
+        <li><a href="https://github.com/systemgroupnet/cocoindex-hnsw-lancedb/blob/main/docs/branch-search.md">Branch search design</a></li>
+        <li><a href="https://github.com/systemgroupnet/cocoindex-hnsw-lancedb/blob/main/EMBEDDINGS.md">Embedding models</a></li>
+        <li><a href="https://github.com/systemgroupnet/cocoindex-hnsw-lancedb/blob/main/CONTRIBUTING.md">Contributing</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Built on</h4>
+      <ul>
+        <li><a href="https://cocoindex.io/docs-v1/">CocoIndex v1</a></li>
+        <li><a href="https://lancedb.github.io/lancedb/">LanceDB</a></li>
+        <li><a href="https://github.com/BurntSushi/ripgrep">ripgrep</a></li>
+        <li><a href="https://modelcontextprotocol.io/">Model Context Protocol</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ── theme ────────────────────────────────────────────────────────────── */
+  var root = document.documentElement;
+  var stored = null;
+  try { stored = localStorage.getItem("ccc-theme"); } catch (e) { /* private mode */ }
+  if (stored === "dark" || stored === "light") root.setAttribute("data-theme", stored);
+
+  function currentTheme() {
+    var set = root.getAttribute("data-theme");
+    if (set) return set;
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+  document.getElementById("theme").addEventListener("click", function () {
+    var next = currentTheme() === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("ccc-theme", next); } catch (e) { /* ignore */ }
+    readTokens();
+    paint(reduced.matches ? undefined : 0);
+  });
+
+  /* ── copy buttons ─────────────────────────────────────────────────────── */
+  Array.prototype.forEach.call(document.querySelectorAll(".copy"), function (btn) {
+    btn.addEventListener("click", function () {
+      var block = btn.closest(".code").querySelector("pre");
+      var text = block.innerText;
+      var done = function () {
+        btn.textContent = "copied";
+        setTimeout(function () { btn.textContent = "copy"; }, 1600);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () { btn.textContent = "failed"; });
+      } else {
+        btn.textContent = "failed";
+      }
+    });
+  });
+
+  /* ── hnsw figure ──────────────────────────────────────────────────────── */
+  var canvas = document.getElementById("hnsw");
+  var ctx = canvas.getContext("2d");
+  var stateEl = document.getElementById("fig-state");
+  var reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+  var BANDS = [0.16, 0.5, 0.84];
+  var COUNTS = [5, 11, 26];
+  var DEGREE = [2, 3, 3];
+  var css = {};
+
+  function seeded(seed) {
+    return function () {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return seed / 4294967296;
+    };
+  }
+
+  /* Layer 0 here is the sparse top; the last layer holds every chunk. */
+  function buildGraph() {
+    var rand = seeded(20260803);
+    return COUNTS.map(function (count, li) {
+      var nodes = [];
+      for (var i = 0; i < count; i++) {
+        nodes.push({
+          x: 0.09 + ((i + 0.5) / count) * 0.82 + (rand() - 0.5) * (0.5 / count),
+          y: BANDS[li] + (rand() - 0.5) * 0.1
+        });
+      }
+      nodes.sort(function (a, b) { return a.x - b.x; });
+      var edges = [];
+      var seen = {};
+      nodes.forEach(function (node, i) {
+        var order = nodes
+          .map(function (other, j) { return { j: j, d: Math.abs(other.x - node.x) }; })
+          .filter(function (c) { return c.j !== i; })
+          .sort(function (a, b) { return a.d - b.d; })
+          .slice(0, DEGREE[li]);
+        order.forEach(function (c) {
+          var key = Math.min(i, c.j) + ":" + Math.max(i, c.j);
+          if (seen[key]) return;
+          seen[key] = 1;
+          edges.push([Math.min(i, c.j), Math.max(i, c.j)]);
+        });
+      });
+      return { nodes: nodes, edges: edges };
+    });
+  }
+
+  /* Greedy descent: hop toward the target within a layer, then drop a level. */
+  function buildPath(layers, targetIdx) {
+    var bottom = layers[layers.length - 1];
+    var target = bottom.nodes[targetIdx];
+    var steps = [];
+    var cur = 0;
+
+    for (var li = 0; li < layers.length; li++) {
+      var layer = layers[li];
+      var adjacency = layer.nodes.map(function () { return []; });
+      layer.edges.forEach(function (e) {
+        adjacency[e[0]].push(e[1]);
+        adjacency[e[1]].push(e[0]);
+      });
+      for (var guard = 0; guard < 40; guard++) {
+        var best = cur;
+        var bestD = Math.abs(layer.nodes[cur].x - target.x);
+        adjacency[cur].forEach(function (n) {
+          var d = Math.abs(layer.nodes[n].x - target.x);
+          if (d < bestD - 1e-6) { bestD = d; best = n; }
+        });
+        if (best === cur) break;
+        steps.push({ kind: "hop", from: layer.nodes[cur], to: layer.nodes[best], layer: li });
+        cur = best;
+      }
+      if (li < layers.length - 1) {
+        var next = layers[li + 1].nodes;
+        var pick = 0;
+        var pickD = Infinity;
+        next.forEach(function (n, j) {
+          var d = Math.abs(n.x - layer.nodes[cur].x);
+          if (d < pickD) { pickD = d; pick = j; }
+        });
+        steps.push({ kind: "drop", from: layer.nodes[cur], to: next[pick], layer: li });
+        cur = pick;
+      }
+    }
+    return { steps: steps, target: target, entry: layers[0].nodes[0] };
+  }
+
+  var layers = buildGraph();
+
+  /* Most bottom-layer targets sit under a top-layer node, so the descent
+     collapses into one vertical drop. Pick the target whose path actually
+     hops inside the most layers — a truer picture of a greedy search. */
+  function chooseTarget() {
+    var best = null;
+    for (var i = 0; i < layers[layers.length - 1].nodes.length; i++) {
+      var candidate = buildPath(layers, i);
+      var busy = {};
+      var hops = 0;
+      candidate.steps.forEach(function (s) {
+        if (s.kind !== "hop") return;
+        hops++;
+        busy[s.layer] = 1;
+      });
+      /* Prefer a path that still hops in the base layer — that last local
+         refinement is the part of the search worth showing. */
+      var score = (busy[layers.length - 1] ? 1000 : 0) + Object.keys(busy).length * 100 + hops;
+      if (!best || score > best.score) best = { score: score, walk: candidate };
+    }
+    return best.walk;
+  }
+
+  var walk = chooseTarget();
+  var timeline = walk.steps.map(function (s) { return s.kind === "drop" ? 520 : 360; });
+  var totalMs = timeline.reduce(function (a, b) { return a + b; }, 0);
+  var HOLD = 1400;
+
+  function readTokens() {
+    var s = getComputedStyle(root);
+    css = {
+      edge: s.getPropertyValue("--graph-edge").trim(),
+      node: s.getPropertyValue("--text-faint").trim(),
+      accent: s.getPropertyValue("--accent-graph").trim(),
+      cool: s.getPropertyValue("--cool").trim(),
+      band: s.getPropertyValue("--rule-soft").trim(),
+      ground: s.getPropertyValue("--surface").trim()
+    };
+  }
+
+  var W = 0, H = 0;
+  function resize() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    var rect = canvas.getBoundingClientRect();
+    W = rect.width;
+    H = rect.height;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  var PAD_X = 18;
+  function px(n) { return PAD_X + n.x * (W - PAD_X * 2); }
+  function py(n) { return 26 + n.y * (H - 52); }
+
+  function paint(elapsed) {
+    if (!W || !H) return;
+    var t = typeof elapsed === "number" ? elapsed : totalMs + HOLD;
+    ctx.clearRect(0, 0, W, H);
+
+    /* band guides */
+    ctx.strokeStyle = css.band;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 4]);
+    BANDS.forEach(function (b) {
+      var y = 26 + b * (H - 52);
+      ctx.beginPath();
+      ctx.moveTo(8, y);
+      ctx.lineTo(W - 8, y);
+      ctx.stroke();
+    });
+    ctx.setLineDash([]);
+
+    /* resting graph */
+    ctx.strokeStyle = css.edge;
+    ctx.lineWidth = 1;
+    layers.forEach(function (layer) {
+      layer.edges.forEach(function (e) {
+        var a = layer.nodes[e[0]], b = layer.nodes[e[1]];
+        ctx.beginPath();
+        ctx.moveTo(px(a), py(a));
+        ctx.lineTo(px(b), py(b));
+        ctx.stroke();
+      });
+    });
+    ctx.fillStyle = css.node;
+    layers.forEach(function (layer) {
+      layer.nodes.forEach(function (n) {
+        ctx.beginPath();
+        ctx.arc(px(n), py(n), 2.4, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    });
+
+    /* traversed path up to t */
+    var acc = 0;
+    var head = null;
+    for (var i = 0; i < walk.steps.length; i++) {
+      var step = walk.steps[i];
+      var dur = timeline[i];
+      var local = (t - acc) / dur;
+      if (local <= 0) break;
+      var f = Math.min(local, 1);
+      var ax = px(step.from), ay = py(step.from);
+      var bx = px(step.to), by = py(step.to);
+      var cx = ax + (bx - ax) * f, cy = ay + (by - ay) * f;
+
+      ctx.strokeStyle = css.accent;
+      ctx.lineWidth = step.kind === "drop" ? 1.3 : 1.8;
+      ctx.setLineDash(step.kind === "drop" ? [3, 3] : []);
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(cx, cy);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = css.accent;
+      ctx.beginPath();
+      ctx.arc(ax, ay, 3.1, 0, Math.PI * 2);
+      ctx.fill();
+
+      head = { x: cx, y: cy, settled: f >= 1 };
+      acc += dur;
+    }
+
+    /* entry marker */
+    ctx.strokeStyle = css.accent;
+    ctx.lineWidth = 1.2;
+    ctx.strokeRect(px(walk.entry) - 4.5, py(walk.entry) - 4.5, 9, 9);
+
+    /* target */
+    var tx = px(walk.target), ty = py(walk.target);
+    var arrived = t >= totalMs;
+    ctx.strokeStyle = arrived ? css.accent : css.node;
+    ctx.lineWidth = arrived ? 1.6 : 1;
+    ctx.beginPath();
+    ctx.arc(tx, ty, arrived ? 7.5 : 6, 0, Math.PI * 2);
+    ctx.stroke();
+    if (arrived) {
+      ctx.fillStyle = css.accent;
+      ctx.beginPath();
+      ctx.arc(tx, ty, 3.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    /* traveller */
+    if (head && !arrived) {
+      ctx.fillStyle = css.cool;
+      ctx.globalAlpha = 0.22;
+      ctx.beginPath();
+      ctx.arc(head.x, head.y, 8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.beginPath();
+      ctx.arc(head.x, head.y, 3.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    if (stateEl) stateEl.textContent = arrived ? "match found" : "descending";
+  }
+
+  var start = null;
+  function frame(now) {
+    if (start === null) start = now;
+    var t = now - start;
+    if (t > totalMs + HOLD) { start = now; t = 0; }
+    paint(t);
+    requestAnimationFrame(frame);
+  }
+
+  readTokens();
+  resize();
+
+  if (window.ResizeObserver) {
+    new ResizeObserver(function () { resize(); if (reduced.matches) paint(); }).observe(canvas);
+  } else {
+    window.addEventListener("resize", function () { resize(); if (reduced.matches) paint(); });
+  }
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
+    readTokens();
+    if (reduced.matches) paint();
+  });
+
+  if (reduced.matches) {
+    paint();
+  } else {
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
